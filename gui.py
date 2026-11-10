@@ -1,0 +1,744 @@
+"""Browser UI for mcp-setup-gui.
+
+Run:  uv run gui.py            (add --no-browser to skip opening a tab)
+
+It serves pages on 127.0.0.1 only and opens your browser with a one-time link.
+Everything it does goes through the same code as the command-line tools:
+import_openapi.py for importing, install.py for installing, runtime.py for testing.
+
+Pages are plain HTML forms handled in Python. There is no JavaScript.
+"""
+
+import argparse
+import copy
+import os
+import hashlib
+import html
+import json
+import secrets
+import socket
+import sys
+import tempfile
+import threading
+import uuid
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlencode
+
+import anyio
+import keyring
+import uvicorn
+from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from starlette.routing import Route
+
+import import_openapi as importer
+import install as installer
+
+HERE = Path(__file__).resolve().parent
+KEYCHAIN_SERVICE = "mcp-setup-gui"
+COOKIE = "mcpgui_session"
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = free_port()
+TOKEN = secrets.token_urlsafe(24)
+ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+ALLOWED_ORIGINS = {f"http://{h}" for h in ALLOWED_HOSTS}
+DRAFTS = {}  # import drafts waiting for the user to pick operations; in memory only
+
+
+class UserError(Exception):
+    """Something the user can fix. Shown on the page instead of a stack trace."""
+
+
+# ---------------------------------------------------------------- security ---
+
+def same(a, b):
+    return secrets.compare_digest(str(a).encode(), str(b).encode())
+
+
+async def guard(request: Request, call_next):
+    # 1. DNS rebinding: a malicious site can point its own domain at 127.0.0.1,
+    #    but it can't make the browser send our Host header.
+    if request.headers.get("host") not in ALLOWED_HOSTS:
+        return PlainTextResponse("Forbidden: unexpected Host header.", status_code=403)
+
+    # 2. The one-time link from the terminal sets a session cookie, then drops the token from the URL.
+    token = request.query_params.get("t")
+    if token is not None and same(token, TOKEN):
+        response = RedirectResponse(request.url.path, status_code=303)
+        response.set_cookie(COOKIE, TOKEN, httponly=True, samesite="strict")
+        return response
+
+    # 3. Every other request needs that cookie. Other sites can't read or send it.
+    if not same(request.cookies.get(COOKIE, ""), TOKEN):
+        return PlainTextResponse(
+            "Not signed in. Open the link printed in the terminal where gui.py is running.",
+            status_code=403)
+
+    # 4. CSRF: form posts must come from our own pages.
+    if request.method == "POST" and request.headers.get("origin") not in ALLOWED_ORIGINS:
+        return PlainTextResponse("Forbidden: cross-site request.", status_code=403)
+
+    response = await call_next(request)
+    # No scripts at all, no framing, forms may only post back here
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+        "base-uri 'none'; frame-ancestors 'none'")
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"  # "no-referrer" makes Chrome send Origin: null on form posts
+    return response
+
+
+# ------------------------------------------------------------------ helpers ---
+
+e = html.escape
+
+STYLE = """
+* { box-sizing: border-box; }
+body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; color: #1d1d1f; background: #f6f6f4; }
+header { background: #1d1d1f; color: #fff; padding: 12px 28px; }
+header a { color: #fff; text-decoration: none; font-weight: 600; }
+main { max-width: 1100px; margin: 0 auto; padding: 24px 28px 60px; }
+h1 { font-size: 24px; margin: 0 0 4px; } h2 { font-size: 18px; margin: 32px 0 10px; } h3 { font-size: 15px; margin: 16px 0 6px; }
+.sub { color: #666; margin: 0 0 16px; }
+.card { background: #fff; border: 1px solid #e2e2de; border-radius: 10px; padding: 18px 20px; margin: 14px 0; }
+table { border-collapse: collapse; width: 100%; background: #fff; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #ecece8; vertical-align: top; }
+th { font-size: 13px; color: #555; font-weight: 600; background: #fafaf8; }
+label { display: block; font-weight: 600; font-size: 13px; margin: 12px 0 4px; }
+input[type=text], input[type=password], select, textarea { width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font: inherit; background: #fff; }
+textarea { min-height: 64px; font-size: 14px; }
+textarea.code, pre { font: 13px/1.45 ui-monospace, Consolas, monospace; }
+pre { background: #1d1d1f; color: #eaeaea; padding: 14px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }
+button { background: #1d1d1f; color: #fff; border: 0; border-radius: 6px; padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer; margin-top: 14px; }
+button.secondary { background: #fff; color: #1d1d1f; border: 1px solid #bbb; }
+button.danger { background: #b42318; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; align-items: end; }
+.tag { display: inline-block; font-size: 12px; padding: 1px 7px; border-radius: 10px; background: #eee; margin-right: 4px; }
+.ok { background: #e3f4e1; color: #1e6b1a; } .warn { background: #fdf0d5; color: #8a5a00; } .bad { background: #fde3e1; color: #a1170c; }
+.msg { padding: 10px 14px; border-radius: 8px; margin: 0 0 16px; }
+.msg.info { background: #e3f4e1; } .msg.error { background: #fde3e1; }
+.muted { color: #777; font-size: 13px; }
+code { font: 13px ui-monospace, Consolas, monospace; background: #f0f0ec; padding: 1px 4px; border-radius: 4px; }
+"""
+
+
+def page(title, body, request=None, error=None):
+    msg = request.query_params.get("msg") if request else None
+    banner = ""
+    if error:
+        banner = f'<div class="msg error">{e(str(error))}</div>'
+    elif msg:
+        banner = f'<div class="msg info">{e(msg)}</div>'
+    return HTMLResponse(f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{e(title)} · MCP Setup</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><style>{STYLE}</style></head>
+<body><header><a href="/">MCP Setup</a></header><main>{banner}{body}</main></body></html>""")
+
+
+def go(path, **params):
+    query = "?" + urlencode(params) if params else ""
+    return RedirectResponse(path + query, status_code=303)
+
+
+def handled(endpoint):
+    """Turn errors the user can fix into a readable page."""
+    async def wrapper(request):
+        try:
+            return await endpoint(request)
+        except (UserError, installer.InstallError, importer.SpecError) as err:
+            back = request.headers.get("referer") or "/"
+            return page("Problem", f'<p><a href="{e(back)}">Back</a></p>', request, error=err)
+    return wrapper
+
+
+def list_projects():
+    found = []
+    for path in sorted(HERE.glob("*.json")) + sorted((HERE / "examples").glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("apis"), list) and "name" in data:
+            found.append((path.relative_to(HERE).as_posix(), data))
+    return found
+
+
+def open_project(rel):
+    # Only files we listed ourselves: no path tricks through the form
+    for r, data in list_projects():
+        if r == rel:
+            return HERE / r, data
+    raise UserError(f"No project file called {rel!r} in this folder.")
+
+
+def secret_stored(api):
+    auth = api.get("auth")
+    if not auth:
+        return None
+    account = auth["secretRef"].removeprefix("secret://")
+    return keyring.get_password(KEYCHAIN_SERVICE, account) is not None
+
+
+def desktop_status(path, data):
+    """Where (if anywhere) this project is installed in Claude Desktop."""
+    for config in installer.candidate_configs():
+        try:
+            servers = installer.read_json(config).get("mcpServers", {})
+        except (OSError, json.JSONDecodeError):
+            continue
+        entry = servers.get(data["name"])
+        if entry and str(path) in [str(a) for a in entry.get("args", [])]:
+            return "installed", config
+        if entry:
+            return "conflict", config
+    return "not installed", None
+
+
+def status_tag(state):
+    css = {"installed": "ok", "conflict": "bad"}.get(state, "")
+    text = {"installed": "Installed in Claude Desktop", "conflict": "Name used by another entry",
+            "not installed": "Not installed"}[state]
+    return f'<span class="tag {css}">{text}</span>'
+
+
+def args_summary(tool):
+    schema = tool.get("inputSchema", {})
+    required = set(schema.get("required", []))
+    names = [f"{n}*" if n in required else n for n in schema.get("properties", {})]
+    return ", ".join(names) or "none"
+
+
+def text_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# -------------------------------------------------------------------- home ---
+
+@handled
+async def home(request):
+    projects = list_projects()
+    rows = ""
+    for rel, data in projects:
+        tools = [t for a in data["apis"] for t in a.get("tools", [])]
+        enabled = sum(1 for t in tools if t.get("enabled", True))
+        state, _ = desktop_status(HERE / rel, data)
+        rows += (f'<tr><td><a href="/project?{urlencode({"file": rel})}"><b>{e(data["name"])}</b></a></td>'
+                 f'<td><code>{e(rel)}</code></td><td>{len(data["apis"])}</td>'
+                 f'<td>{enabled} of {len(tools)}</td><td>{status_tag(state)}</td></tr>')
+    table = (f"<table><tr><th>Project</th><th>File</th><th>APIs</th><th>Tools enabled</th><th>Claude Desktop</th></tr>{rows}</table>"
+             if rows else '<p class="muted">No projects yet. Import an API below.</p>')
+
+    targets = '<option value="__new__">New project</option>' + "".join(
+        f'<option value="{e(rel)}">Add to {e(data["name"])} ({e(rel)})</option>' for rel, data in projects)
+
+    body = f"""
+<h1>Projects</h1><p class="sub">Each project becomes one MCP server in Claude.</p>
+{table}
+<h2>Import an API</h2>
+<form class="card" method="post" action="/import">
+  <label>OpenAPI spec: URL or file path</label>
+  <input type="text" name="spec" placeholder="https://petstore3.swagger.io/api/v3/openapi.json" required>
+  <div class="row">
+    <div><label>Add to</label><select name="target">{targets}</select></div>
+    <div><label>New project name <span class="muted">(new projects only; defaults to the spec title)</span></label>
+      <input type="text" name="new_name" placeholder="petstore"></div>
+    <div><label>API id <span class="muted">(optional)</span></label><input type="text" name="api_id"></div>
+    <div><label>Base URL <span class="muted">(only if the spec's is relative)</span></label><input type="text" name="base_url"></div>
+  </div>
+  <label>Only show operations matching <span class="muted">(optional; path, name or tag)</span></label>
+  <input type="text" name="filter">
+  <button>Read spec</button>
+</form>"""
+    return page("Projects", body, request)
+
+
+# ------------------------------------------------------------------ import ---
+
+@handled
+async def start_import(request):
+    form = await request.form()
+    source = form.get("spec", "").strip()
+    if not source:
+        raise UserError("Enter a spec URL or file path.")
+    if not source.lower().startswith(("http://", "https://")):
+        source = str((HERE / source).resolve()) if not Path(source).is_absolute() else source
+
+    raw = await run_in_threadpool(importer.load_spec, source)
+    spec = importer.deref(raw, raw)
+    title = (spec.get("info") or {}).get("title") or "api"
+
+    target = form.get("target", "__new__")
+    if target == "__new__":
+        project_name = importer.slug(form.get("new_name", "").strip() or title)
+        out = HERE / f"{project_name}.json"
+        if out.exists():
+            raise UserError(f"{out.name} already exists. Choose it under 'Add to', or pick another name.")
+    else:
+        out, data = open_project(target)
+        project_name = data["name"]
+    api_id = importer.slug(form.get("api_id", "").strip() or title)
+
+    warnings = []
+    url = importer.base_url(spec, source, form.get("base_url", "").strip() or None)
+    auth, scheme = importer.detect_auth(spec, project_name, api_id, warnings)
+    candidates, skipped = importer.candidate_tools(spec, warnings)
+
+    needle = form.get("filter", "").strip().lower()
+    if needle:
+        candidates = [c for c in candidates
+                      if needle in c["tool"]["path"].lower() or needle in c["tool"]["name"]
+                      or any(needle in str(t).lower() for t in c["tags"])]
+    if not candidates:
+        raise UserError("No operations to import" + (" match that filter." if needle else "."))
+
+    existing_ids = [a.get("id") for a in json.loads(out.read_text(encoding="utf-8"))["apis"]] if out.exists() else []
+    draft_id = uuid.uuid4().hex
+    DRAFTS[draft_id] = {
+        "title": title, "url": url, "auth": auth, "scheme": scheme, "candidates": candidates,
+        "skipped": skipped, "warnings": warnings, "out": out, "project_name": project_name,
+        "api_id": api_id, "replaces": api_id in existing_ids,
+    }
+    return go(f"/draft/{draft_id}")
+
+
+def get_draft(request):
+    draft = DRAFTS.get(request.path_params["draft_id"])
+    if not draft:
+        raise UserError("That import has expired (the GUI was restarted). Start the import again.")
+    return draft
+
+
+async def render_draft(request, error=None):
+    draft = get_draft(request)
+    if draft["auth"]:
+        p = draft["auth"]["placement"]
+        auth = (f'<code>{e(draft["scheme"])}</code>, sent in the {e(p["in"])} <code>{e(p["name"])}</code>'
+                + (f' as <code>{e(p["prefix"])}&lt;token&gt;</code>' if p.get("prefix") else ""))
+    else:
+        auth = "none"
+    notes = "".join(f"<li>{e(n)}</li>" for n in draft["warnings"] + draft["skipped"])
+    notes = f'<div class="card"><b>Notes</b><ul>{notes}</ul></div>' if notes else ""
+
+    rows = ""
+    for i, c in enumerate(draft["candidates"]):
+        t = c["tool"]
+        read_only = t["annotations"].get("readOnlyHint", False)
+        checked = "checked" if read_only and not c["deprecated"] else ""
+        flags = ""
+        if t["annotations"].get("destructiveHint"):
+            flags += '<span class="tag bad">destructive</span>'
+        elif not read_only:
+            flags += '<span class="tag warn">writes</span>'
+        if c["deprecated"]:
+            flags += '<span class="tag">deprecated</span>'
+        short = len(t["description"]) < importer.WEAK_DESCRIPTION
+        hint = '<div class="muted">Short description: say when Claude should use this.</div>' if short else ""
+        rows += f"""<tr>
+  <td><input type="checkbox" name="sel" value="{i}" {checked}></td>
+  <td><b>{e(t["name"])}</b><br><span class="muted">{e(t["method"])} {e(t["path"])}</span><br>{flags}
+      <div class="muted">Args: {e(args_summary(t))}</div></td>
+  <td><textarea name="desc_{i}">{e(t["description"])}</textarea>{hint}</td></tr>"""
+
+    replace = ""
+    if draft["replaces"]:
+        replace = (f'<label><input type="checkbox" name="force" value="1"> Replace the API '
+                   f'<code>{e(draft["api_id"])}</code> already in {e(draft["out"].name)}</label>')
+
+    body = f"""
+<h1>{e(draft["title"])}</h1>
+<p class="sub">Base URL <code>{e(draft["url"])}</code> · Auth: {auth} · Writing to <code>{e(draft["out"].name)}</code></p>
+{notes}
+<form method="post">
+<p class="muted">Read-only operations are pre-selected. The description is what Claude reads to decide
+when to call a tool, so edit any that are vague. More than {importer.TOOL_WARN_COUNT} tools makes it harder
+for Claude to pick the right one.</p>
+<table><tr><th></th><th>Operation</th><th>Description</th></tr>{rows}</table>
+{replace}
+<button>Write project</button>
+</form>"""
+    return page(draft["title"], body, request, error=error)
+
+
+@handled
+async def save_draft(request):
+    draft = get_draft(request)
+    form = await request.form()
+    picked = sorted({int(v) for v in form.getlist("sel") if v.isdigit()})
+    picked = [i for i in picked if i < len(draft["candidates"])]
+    if not picked:
+        return await render_draft(request, error="Select at least one operation.")
+
+    tools = []
+    for i in picked:
+        tool = copy.deepcopy(draft["candidates"][i]["tool"])
+        tool["description"] = " ".join(form.get(f"desc_{i}", "").split()) or tool["description"]
+        tools.append(tool)
+
+    api = {"id": draft["api_id"], "baseUrl": draft["url"], "source": "openapi"}
+    if draft["auth"]:
+        api["auth"] = draft["auth"]
+    api["tools"] = tools
+    importer.write_project(draft["out"], api, draft["project_name"], bool(form.get("force")))
+    DRAFTS.pop(request.path_params["draft_id"], None)
+
+    rel = draft["out"].relative_to(HERE).as_posix()
+    msg = f"Wrote {len(tools)} tool(s) to {rel}."
+    if draft["auth"]:
+        msg += " Store the API's secret below, then install."
+    return go("/project", file=rel, msg=msg)
+
+
+# ----------------------------------------------------------------- project ---
+
+@handled
+async def show_project(request):
+    rel = request.query_params.get("file", "")
+    path, data = open_project(rel)
+    state, where = desktop_status(path, data)
+
+    apis_html = ""   # API cards with their secret forms (must sit outside the tools form)
+    tables_html = ""  # tool tables, inside the one "Save tools" form
+    tool_options = ""
+    for a_i, api in enumerate(data["apis"]):
+        stored = secret_stored(api)
+        if api.get("auth"):
+            p = api["auth"]["placement"]
+            secret_tag = '<span class="tag ok">secret stored</span>' if stored else '<span class="tag bad">secret missing</span>'
+            secret_form = f"""
+<form method="post" action="/secret" class="row">
+  <input type="hidden" name="file" value="{e(rel)}"><input type="hidden" name="api" value="{e(api["id"])}">
+  <div><label>{"Replace" if stored else "Store"} the secret <span class="muted">(kept in the OS keychain, never in a file)</span></label>
+  <input type="password" name="value" autocomplete="off" required></div>
+  <div><button class="secondary">Save to keychain</button></div>
+</form>"""
+            auth_line = (f'Auth: {e(p["in"])} <code>{e(p["name"])}</code>'
+                         + (f' as <code>{e(p["prefix"])}&lt;token&gt;</code>' if p.get("prefix") else "")
+                         + f' · {secret_tag}')
+        else:
+            secret_form, auth_line = "", "Auth: none"
+
+        rows = ""
+        for t_i, tool in enumerate(api.get("tools", [])):
+            on = "checked" if tool.get("enabled", True) else ""
+            if on:
+                tool_options += f'<option value="{e(tool["name"])}">{e(tool["name"])}</option>'
+            rows += f"""<tr>
+  <td><input type="checkbox" name="en_{a_i}_{t_i}" value="1" {on}></td>
+  <td><b>{e(tool["name"])}</b><br><span class="muted">{e(tool["method"])} {e(tool["path"])}</span>
+      <div class="muted">Args: {e(args_summary(tool))}</div></td>
+  <td><textarea name="desc_{a_i}_{t_i}">{e(tool.get("description", ""))}</textarea></td></tr>"""
+        apis_html += f"""
+<div class="card"><b>{e(api["id"])}</b> <span class="muted"><code>{e(api["baseUrl"])}</code></span>
+<div>{auth_line}</div>{secret_form}</div>"""
+        tables_html += f"""
+<h3>{e(api["id"])}</h3>
+<table><tr><th>On</th><th>Tool</th><th>Description</th></tr>{rows}</table>"""
+
+    configs = installer.candidate_configs()
+    config_options = "".join(
+        f'<option value="{e(str(c))}" {"selected" if where and c == where else ""}>{e(str(c))}</option>'
+        for c in configs)
+    if configs:
+        config_field = f'<label>Claude Desktop config</label><select name="config">{config_options}</select>'
+    else:
+        config_field = ('<p class="muted">No Claude Desktop config found. In Claude Desktop open Settings, '
+                        'Desktop app, Extensions, Edit config to create it, or paste its path here.</p>')
+    config_field += ('<label>Or a config path <span class="muted">(optional)</span></label>'
+                     '<input type="text" name="custom_config">')
+
+    body = f"""
+<h1>{e(data["name"])}</h1>
+<p class="sub"><code>{e(rel)}</code> · {status_tag(state)}</p>
+
+<h2>APIs</h2>
+{apis_html}
+
+<h2>Tools</h2>
+<form method="post" action="/project/save">
+<input type="hidden" name="file" value="{e(rel)}">
+{tables_html}
+<button>Save tools</button> <span class="muted">Claude Desktop picks up changes after a restart.</span>
+</form>
+
+<h2>Test a tool</h2>
+<form class="card" method="post" action="/test">
+  <input type="hidden" name="file" value="{e(rel)}">
+  <label>Tool</label><select name="tool">{tool_options}</select>
+  <label>Arguments (JSON) <span class="muted">* marks required arguments in the list above</span></label>
+  <textarea class="code" name="args">{{}}</textarea>
+  <button>Run</button>
+  <p class="muted">Starts the runtime the same way Claude Desktop does and calls the tool once.</p>
+</form>
+
+<h2>Claude Desktop</h2>
+<form class="card" method="post" action="/install/preview">
+  <input type="hidden" name="file" value="{e(rel)}">
+  {config_field}
+  <p class="muted">Quit Claude Desktop before writing. It saves its own settings to the same file.</p>
+  <button name="action" value="add">Preview install</button>
+  <button class="secondary" name="action" value="remove">Preview removal</button>
+</form>"""
+    return page(data["name"], body, request)
+
+
+@handled
+async def save_project(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    path, data = open_project(rel)
+    for a_i, api in enumerate(data["apis"]):
+        for t_i, tool in enumerate(api.get("tools", [])):
+            tool["enabled"] = form.get(f"en_{a_i}_{t_i}") == "1"
+            desc = " ".join(form.get(f"desc_{a_i}_{t_i}", "").split())
+            if desc:
+                tool["description"] = desc
+    installer.atomic_write(path, installer.to_text(data))
+    return go("/project", file=rel, msg="Saved. Restart Claude Desktop if this project is installed.")
+
+
+@handled
+async def store_secret(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    _, data = open_project(rel)
+    api = next((a for a in data["apis"] if a.get("id") == form.get("api")), None)
+    if not api or not api.get("auth"):
+        raise UserError("That API doesn't use a secret.")
+    value = form.get("value", "")
+    if not value.strip():
+        raise UserError("The secret was empty, so nothing was stored.")
+    account = api["auth"]["secretRef"].removeprefix("secret://")
+    keyring.set_password(KEYCHAIN_SERVICE, account, value)
+    return go("/project", file=rel, msg=f"Secret for {api['id']} saved to the OS keychain.")
+
+
+# -------------------------------------------------------------------- test ---
+
+def run_tool(project_path, tool_name, arguments):
+    """Start the runtime like Claude Desktop does, call one tool, return (result, runtime stderr)."""
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    with tempfile.TemporaryFile("w+", encoding="utf-8") as errlog:
+        async def call():
+            params = StdioServerParameters(
+                command=sys.executable,
+                args=[str(installer.RUNTIME), "--project", str(project_path)],
+                env=dict(os.environ))
+            with anyio.fail_after(60):
+                async with stdio_client(params, errlog=errlog) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        return await session.call_tool(tool_name, arguments)
+
+        try:
+            result = anyio.run(call)
+            error = None
+        except Exception as err:  # the runtime crashed or timed out; its stderr says why
+            result, error = None, err
+        errlog.seek(0)
+        stderr = errlog.read()
+    return result, error, stderr
+
+
+@handled
+async def test_tool(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    path, data = open_project(rel)
+    tool = form.get("tool", "")
+    try:
+        arguments = json.loads(form.get("args", "") or "{}")
+    except json.JSONDecodeError as err:
+        raise UserError(f"Arguments aren't valid JSON: {err}")
+    if not isinstance(arguments, dict):
+        raise UserError('Arguments must be a JSON object, like {"q": "Boise,US"}.')
+
+    result, error, stderr = await run_in_threadpool(run_tool, path, tool, arguments)
+
+    if result is None:
+        status = '<span class="tag bad">runtime failed</span>'
+        output = f"The runtime didn't answer ({type(error).__name__}). Its error output is below."
+        raw = ""
+    else:
+        status = '<span class="tag bad">tool error</span>' if result.is_error else '<span class="tag ok">ok</span>'
+        text = "\n".join(getattr(c, "text", "") for c in result.content)
+        try:
+            output = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError):
+            output = text
+        raw = json.dumps(result.model_dump(by_alias=True, exclude_none=True), indent=2, ensure_ascii=False)
+
+    body = f"""
+<h1>{e(tool)}</h1><p class="sub">{e(data["name"])} · {status} · <a href="/project?{urlencode({"file": rel})}">Back to project</a></p>
+<h2>Arguments</h2><pre>{e(json.dumps(arguments, indent=2, ensure_ascii=False))}</pre>
+<h2>Response</h2><pre>{e(output)}</pre>
+{f'<h2>Raw MCP result</h2><pre>{e(raw)}</pre>' if raw else ''}
+{f'<h2>Runtime log (stderr)</h2><pre>{e(stderr)}</pre>' if stderr.strip() else ''}"""
+    return page(f"Test {tool}", body, request)
+
+
+# ----------------------------------------------------------------- install ---
+
+def chosen_config(form):
+    custom = form.get("custom_config", "").strip().strip('"')
+    if custom:
+        path = Path(custom).expanduser().resolve()
+        if path.name != "claude_desktop_config.json" or not path.is_file():
+            raise UserError("That path isn't an existing claude_desktop_config.json.")
+        return path
+    allowed = {str(c): c for c in installer.candidate_configs()}
+    picked = form.get("config", "")
+    if picked not in allowed:
+        raise UserError("Pick a Claude Desktop config, or paste its path.")
+    return allowed[picked]
+
+
+def plan_change(action, config, name, project_path):
+    servers = config.get("mcpServers", {})
+    new_config = json.loads(json.dumps(config))  # deep copy
+    notes = []
+    if action == "add":
+        entry = installer.build_entry(project_path)
+        if name in servers and servers[name] != entry and not installer.is_ours(servers[name]):
+            notes.append(f"This replaces an existing entry named '{name}' that this tool didn't create.")
+        new_config.setdefault("mcpServers", {})[name] = entry
+    else:
+        if name not in servers:
+            notes.append(f"'{name}' isn't in this config, so there's nothing to remove.")
+        else:
+            if not installer.is_ours(servers[name]):
+                notes.append(f"The entry '{name}' wasn't created by this tool.")
+            del new_config["mcpServers"][name]
+    return new_config, notes
+
+
+@handled
+async def preview_change(request):
+    form = await request.form()
+    action = "remove" if form.get("action") == "remove" else "add"
+    rel = form.get("file", "")
+    path, data = open_project(rel)
+    config_path = chosen_config(form)
+
+    tools_html = ""
+    if action == "add":
+        await run_in_threadpool(installer.check_project, path)  # secrets present?
+        tools = await run_in_threadpool(installer.verify_runtime, path)
+        items = "".join(f"<li><b>{e(t.name)}</b>: {e(t.description or '')}</li>" for t in tools)
+        tools_html = f'<div class="card"><b>Runtime started. Claude will get {len(tools)} tool(s):</b><ul>{items}</ul></div>'
+
+    original_text, config = installer.load_config(config_path)
+    new_config, notes = plan_change(action, config, data["name"], path)
+    diff = installer.diff_text(config, new_config, config_path.name)
+
+    warnings = [f'<div class="msg error">{e(n)}</div>' for n in notes]
+    if installer.desktop_is_running():
+        warnings.insert(0, '<div class="msg error">Claude Desktop is running. Quit it first '
+                           '(tray icon, Quit), or it may overwrite this change.</div>')
+
+    if new_config == config:
+        confirm = '<p class="muted">Nothing to change.</p>'
+    else:
+        verb = "Install" if action == "add" else "Remove"
+        confirm = f"""
+<form method="post" action="/install/apply">
+  <input type="hidden" name="file" value="{e(rel)}"><input type="hidden" name="action" value="{action}">
+  <input type="hidden" name="custom_config" value="{e(str(config_path))}">
+  <input type="hidden" name="digest" value="{text_hash(original_text)}">
+  <button class="{"danger" if action == "remove" else ""}">{verb}: write this change</button>
+  <span class="muted">The current file is backed up first.</span>
+</form>"""
+
+    title = "Install" if action == "add" else "Remove"
+    body = f"""
+<h1>{title} {e(data["name"])}</h1>
+<p class="sub"><code>{e(str(config_path))}</code> · <a href="/project?{urlencode({"file": rel})}">Back</a></p>
+{tools_html}{"".join(warnings)}
+<h2>Change to the config file</h2><pre>{e(diff)}</pre>
+{confirm}"""
+    return page(title, body, request)
+
+
+@handled
+async def apply_change(request):
+    form = await request.form()
+    action = "remove" if form.get("action") == "remove" else "add"
+    rel = form.get("file", "")
+    path, data = open_project(rel)
+    config_path = chosen_config(form)
+
+    original_text, config = installer.load_config(config_path)
+    if not same(text_hash(original_text), form.get("digest", "")):
+        raise UserError("The config file changed after the preview (Claude Desktop may have saved it). "
+                        "Nothing was written. Preview again.")
+    new_config, _ = plan_change(action, config, data["name"], path)
+    backup = installer.write_config(config_path, original_text, new_config)
+
+    _, fresh = open_project(rel)
+    if action == "add":
+        record = {"client": installer.CLIENT_ID, "configPath": str(config_path), "serverName": data["name"],
+                  "backupPath": str(backup), "status": "registered",
+                  "registeredAt": datetime.now().isoformat(timespec="seconds")}
+        msg = f"Installed. Restart Claude Desktop to load it. Backup: {backup}"
+    else:
+        record = {"configPath": str(config_path), "status": "removed"}
+        msg = f"Removed. Restart Claude Desktop. Backup: {backup}"
+    installer.record_registration(path, fresh, record)
+    return go("/project", file=rel, msg=msg)
+
+
+# --------------------------------------------------------------------- app ---
+
+@handled
+async def show_draft(request):
+    return await render_draft(request)
+
+
+app = Starlette(
+    routes=[
+        Route("/", home),
+        Route("/import", start_import, methods=["POST"]),
+        Route("/draft/{draft_id}", show_draft, methods=["GET"]),
+        Route("/draft/{draft_id}", save_draft, methods=["POST"]),
+        Route("/project", show_project),
+        Route("/project/save", save_project, methods=["POST"]),
+        Route("/secret", store_secret, methods=["POST"]),
+        Route("/test", test_tool, methods=["POST"]),
+        Route("/install/preview", preview_change, methods=["POST"]),
+        Route("/install/apply", apply_change, methods=["POST"]),
+    ],
+    middleware=[Middleware(BaseHTTPMiddleware, dispatch=guard)],
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Browser UI for mcp-setup-gui")
+    parser.add_argument("--no-browser", action="store_true", help="Don't open a browser tab")
+    opts = parser.parse_args()
+
+    url = f"http://127.0.0.1:{PORT}/?t={TOKEN}"
+    print(f"MCP Setup is running. Open:\n  {url}\nPress Ctrl+C to stop.", flush=True)
+    if not opts.no_browser:
+        threading.Timer(1.0, webbrowser.open, [url]).start()
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

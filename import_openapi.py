@@ -133,7 +133,7 @@ def base_url(spec, source, override):
         return url.rstrip("/")
     if re.match(r"https?://", source):
         return urljoin(source, url).rstrip("/")
-    raise SpecError(f"The spec's server URL is relative ({url!r}). Pass --base-url with the full URL.")
+    raise SpecError(f"The spec's server URL is relative ({url!r}). Give the full base URL (--base-url on the command line).")
 
 
 def detect_auth(spec, project_name, api_id, warnings):

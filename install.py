@@ -215,12 +215,16 @@ def is_ours(entry):
     return any(str(a).endswith("runtime.py") for a in args) and "--project" in args
 
 
-def show_diff(before, after, path):
+def diff_text(before, after, path):
     diff = difflib.unified_diff(
         to_text(before).splitlines(keepends=True),
         to_text(after).splitlines(keepends=True),
         fromfile=f"{path} (current)", tofile=f"{path} (new)", n=2)
-    print("".join(diff) or "(no changes)")
+    return "".join(diff) or "(no changes)"
+
+
+def show_diff(before, after, path):
+    print(diff_text(before, after, path))
 
 
 def write_config(config_path, original_text, new_config):

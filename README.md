@@ -4,7 +4,7 @@ Turn an HTTP API into tools Claude can use, without writing server code or hand-
 
 You describe an API in `project.json`. A generic MCP runtime serves every endpoint you list as a tool, and an installer registers it with Claude Desktop safely: it verifies the server first, shows a diff, backs up the config, and can undo the change.
 
-**Status:** milestones 1 and 2 of 7 work: local stdio servers for Claude Desktop, API-key and bearer auth, and import from OpenAPI specs. A browser UI, remote deployment and more clients are planned (see [Roadmap](#roadmap)).
+**Status:** milestones 1 to 3 of 7 work, with a browser UI: local stdio servers for Claude Desktop, API-key and bearer auth, import from OpenAPI specs, and a built-in tool tester. Remote deployment, OAuth and more clients are planned (see [Roadmap](#roadmap)).
 
 ```
 project.json ──► runtime.py ──stdio──► Claude Desktop ──► Claude
@@ -18,6 +18,22 @@ project.json ──► runtime.py ──stdio──► Claude Desktop ──► 
 Connecting Claude to an API today means writing an MCP server, then editing a JSON config file by hand. That config file is shared with the app's own settings, sits in different places on different installs, and one missing comma silently disables every server. API keys usually end up pasted into that file in plain text.
 
 This project makes the server a data file and the install a checked, reversible operation.
+
+## Browser UI
+
+```powershell
+uv run gui.py
+```
+
+It opens a page in your browser where you can:
+
+- **Import an API** from an OpenAPI spec URL or file, tick which operations become tools, and edit their descriptions
+- **Store each API's secret** in the OS keychain
+- **Turn tools on and off** and edit descriptions later
+- **Test a tool**: run it the way Claude Desktop does and see the response, the raw MCP result and the runtime's log
+- **Install or remove** the project in Claude Desktop, after a preview of the exact change to the config file
+
+The UI is plain HTML forms served by Python. It listens on `127.0.0.1` only, and the terminal prints a one-time link that signs your browser in. It uses the same code as the command-line tools below, so you can mix the two.
 
 ## Quick start (Windows, PowerShell)
 
@@ -80,6 +96,7 @@ After importing, read the tool descriptions in the project file. The importer li
 | `uv run install.py add --project project.json` | Verify and register the project with Claude Desktop |
 | `uv run install.py remove --project project.json` | Remove the entry this installer added |
 | `uv run install.py list` | Show every MCP server in each Claude Desktop config found |
+| `uv run gui.py` | Open the browser UI (`--no-browser` to just print the link) |
 | `uv run import_openapi.py SPEC --out project.json` | Turn an OpenAPI spec into tools (see above) |
 | `uv run runtime.py --project project.json` | Run the server by hand (it waits for a client on stdin; Ctrl+C to stop) |
 
@@ -146,6 +163,7 @@ Adding a tool is a JSON edit and a Claude Desktop restart. No code changes.
 - **Writes are opt-in.** The importer pre-selects only read-only operations and marks DELETE operations with `destructiveHint`, so clients can ask before running them.
 - **Config writes are checked and reversible.** The installer refuses to touch a config it can't parse, shows a diff, backs up to `~/.mcpgui/backups`, writes to a temp file and swaps it in, re-reads the result, and restores the backup if it doesn't match.
 - **Nothing is installed blind.** Before writing, the installer starts the runtime exactly as Claude Desktop will and lists the tools Claude is about to get.
+- **The UI only answers to you.** It binds to `127.0.0.1`, signs in with a random one-time token, rejects requests with an unexpected `Host` header (DNS rebinding) or a foreign `Origin` (cross-site form posts), and sends a Content-Security-Policy that allows no scripts. A config change previewed in the UI is refused if the file changed before you confirm.
 - **Merges, never overwrites.** Other servers and the app's own settings are left untouched. Replacing an entry the installer didn't create needs explicit confirmation.
 
 ## Troubleshooting
@@ -163,11 +181,11 @@ Python 3.13, [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk
 ## Roadmap
 
 1. ~~Thin slice: one API, API-key auth, local stdio, Claude Desktop~~
-2. ~~OpenAPI import: generate `project.json` from a spec, pick operations~~ (description editing comes with the UI)
-3. Built-in tester: call each tool from the UI and see the raw JSON-RPC
+2. ~~OpenAPI import: generate `project.json` from a spec, pick operations, edit descriptions~~
+3. ~~Built-in tester: call each tool from the UI and see the raw result~~
 4. Claude Code adapter
 5. Remote deployment: Streamable HTTP, Docker, static bearer auth
 6. OAuth upstream and inbound
 7. MCP Registry servers, more clients, MCPB export
 
-A browser wizard (Python, NiceGUI) wraps each of these as it lands. For now the CLI is the interface.
+The browser UI (`gui.py`) gets each of these as it lands.
