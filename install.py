@@ -158,6 +158,8 @@ def check_project(project_path):
 
     import keyring
     for api in project["apis"]:
+        if "auth" not in api:  # public API, nothing to look up
+            continue
         ref = api["auth"]["secretRef"]
         if not ref.startswith("secret://"):
             raise InstallError(f"{api['id']}: secretRef must start with secret://")

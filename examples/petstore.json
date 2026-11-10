@@ -1,0 +1,215 @@
+{
+  "name": "petstore",
+  "responseByteCap": 50000,
+  "apis": [
+    {
+      "id": "swagger-petstore-open-api-3-0",
+      "baseUrl": "https://petstore3.swagger.io/api/v3",
+      "source": "openapi",
+      "auth": {
+        "secretRef": "secret://petstore/swagger-petstore-open-api-3-0/petstore-auth",
+        "placement": {
+          "in": "header",
+          "name": "Authorization",
+          "prefix": "Bearer "
+        }
+      },
+      "tools": [
+        {
+          "name": "find_pets_by_status",
+          "description": "Finds Pets by status.. Multiple status values can be provided with comma separated strings.",
+          "method": "GET",
+          "path": "/pet/findByStatus",
+          "paramLocations": {
+            "status": "query"
+          },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "default": "available",
+                "enum": [
+                  "available",
+                  "pending",
+                  "sold"
+                ],
+                "description": "Status values that need to be considered for filter"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        },
+        {
+          "name": "find_pets_by_tags",
+          "description": "Finds Pets by tags.. Multiple tags can be provided with comma separated strings. Use tag1, tag2, tag3 for testing.",
+          "method": "GET",
+          "path": "/pet/findByTags",
+          "paramLocations": {
+            "tags": "query"
+          },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Tags to filter by"
+              }
+            },
+            "required": [
+              "tags"
+            ]
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        },
+        {
+          "name": "get_pet_by_id",
+          "description": "Find pet by ID.. Returns a single pet.",
+          "method": "GET",
+          "path": "/pet/{petId}",
+          "paramLocations": {
+            "petId": "path"
+          },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "petId": {
+                "type": "integer",
+                "format": "int64",
+                "description": "ID of pet to return"
+              }
+            },
+            "required": [
+              "petId"
+            ]
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        },
+        {
+          "name": "get_inventory",
+          "description": "Returns pet inventories by status.. Returns a map of status codes to quantities.",
+          "method": "GET",
+          "path": "/store/inventory",
+          "paramLocations": {},
+          "inputSchema": {
+            "type": "object",
+            "properties": {}
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        },
+        {
+          "name": "get_order_by_id",
+          "description": "Find purchase order by ID.. For valid response try integer IDs with value <= 5 or > 10. Other values will generate exceptions.",
+          "method": "GET",
+          "path": "/store/order/{orderId}",
+          "paramLocations": {
+            "orderId": "path"
+          },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "orderId": {
+                "type": "integer",
+                "format": "int64",
+                "description": "ID of order that needs to be fetched"
+              }
+            },
+            "required": [
+              "orderId"
+            ]
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        },
+        {
+          "name": "login_user",
+          "description": "Logs user into the system.. Log into the system.",
+          "method": "GET",
+          "path": "/user/login",
+          "paramLocations": {
+            "username": "query",
+            "password": "query"
+          },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "username": {
+                "type": "string",
+                "description": "The user name for login"
+              },
+              "password": {
+                "type": "string",
+                "description": "The password for login in clear text"
+              }
+            }
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        },
+        {
+          "name": "logout_user",
+          "description": "Logs out current logged in user session.. Log user out of the system.",
+          "method": "GET",
+          "path": "/user/logout",
+          "paramLocations": {},
+          "inputSchema": {
+            "type": "object",
+            "properties": {}
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        },
+        {
+          "name": "get_user_by_name",
+          "description": "Get user by user name.. Get user detail based on username.",
+          "method": "GET",
+          "path": "/user/{username}",
+          "paramLocations": {
+            "username": "path"
+          },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "username": {
+                "type": "string",
+                "description": "The name that needs to be fetched. Use user1 for testing"
+              }
+            },
+            "required": [
+              "username"
+            ]
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "clients": []
+}

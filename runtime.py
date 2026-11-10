@@ -43,10 +43,11 @@ def load_project(path_str):
 
     seen = set()
     for api in project["apis"]:
-        ref = api["auth"]["secretRef"]
-        if not ref.startswith("secret://"):
-            # Stops a pasted literal key from ever living in project.json
-            raise SystemExit(f"{api['id']}: secretRef must start with secret://")
+        if "auth" in api:  # APIs with no auth simply leave it out
+            ref = api["auth"]["secretRef"]
+            if not ref.startswith("secret://"):
+                # Stops a pasted literal key from ever living in project.json
+                raise SystemExit(f"{api['id']}: secretRef must start with secret://")
         for tool in api["tools"]:
             if tool["name"] in seen:
                 raise SystemExit(f"Duplicate tool name: {tool['name']}")
@@ -57,6 +58,8 @@ def load_project(path_str):
 def load_secrets(project):
     keys = {}
     for api in project["apis"]:
+        if "auth" not in api:
+            continue
         ref = api["auth"]["secretRef"]
         account = ref.removeprefix("secret://")
         key = keyring.get_password(KEYCHAIN_SERVICE, account)
@@ -84,21 +87,43 @@ TOOLS = {
 
 # ------------------------------------------------------------ upstream HTTP ---
 
+def location(loc, arg_name):
+    """paramLocations entries are either "query" or {"in": "query", "name": "wireName"}.
+    The object form lets an argument have a different name from the API's,
+    e.g. a body field "id" exposed as "body_id" because a path param is also "id"."""
+    if isinstance(loc, str):
+        return loc, arg_name
+    return loc["in"], loc.get("name", arg_name)
+
+
 async def call_upstream(api, tool, arguments, key):
     base = api["baseUrl"].rstrip("/")
     path = tool["path"]
     query = {}
+    headers = {"accept": "application/json"}
+    body = None
 
-    for name, where in tool.get("paramLocations", {}).items():
-        if name not in arguments:
+    for arg_name, loc in tool.get("paramLocations", {}).items():
+        if arg_name not in arguments:
             continue
-        value = str(arguments[name])
+        where, wire_name = location(loc, arg_name)
+        value = arguments[arg_name]
         if where == "path":
-            if value in (".", ".."):
-                raise ValueError(f"Bad value for {name}")
-            path = path.replace("{" + name + "}", quote(value, safe=""))
+            text = str(value)
+            if text in (".", ".."):
+                raise ValueError(f"Bad value for {arg_name}")
+            path = path.replace("{" + wire_name + "}", quote(text, safe=""))
+        elif where == "query":
+            query[wire_name] = value  # httpx handles lists, numbers and booleans
+        elif where == "header":
+            headers[wire_name] = str(value)
+        elif where == "body":
+            body = body if isinstance(body, dict) else {}
+            body[wire_name] = value
+        elif where == "bodyRaw":
+            body = value  # the whole JSON body, for APIs whose body isn't an object
         else:
-            query[name] = value
+            raise ValueError(f"Unknown parameter location {where!r} for {arg_name}")
 
     url = base + path
 
@@ -106,16 +131,22 @@ async def call_upstream(api, tool, arguments, key):
     if urlsplit(url).netloc != urlsplit(base).netloc:
         raise ValueError("Blocked: request left the API host")
 
-    headers = {"accept": "application/json"}
-    placement = api["auth"]["placement"]
-    if placement["in"] == "header":
-        headers[placement["name"]] = key
-    else:
-        query[placement["name"]] = key
+    # Auth goes in last, so a header argument can never replace it
+    auth = api.get("auth")
+    if auth:
+        placement = auth["placement"]
+        value = placement.get("prefix", "") + key  # e.g. "Bearer " for bearer tokens
+        if placement["in"] == "header":
+            headers[placement["name"]] = value
+        else:
+            query[placement["name"]] = value
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.request(tool["method"], url, params=query, headers=headers)
+            response = await client.request(
+                tool["method"], url, params=query, headers=headers,
+                json=body if body is not None else None,
+            )
     except httpx.RequestError as e:
         # httpx errors can include the full URL, which holds the key when it's a
         # query parameter. Report the error type only.
@@ -161,7 +192,7 @@ async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) ->
         return tool_error(f"Missing required argument(s): {', '.join(missing)}")
 
     try:
-        text = await call_upstream(api, tool, arguments, KEYS[api["id"]])
+        text = await call_upstream(api, tool, arguments, KEYS.get(api["id"]))
     except Exception as e:
         log(f"{params.name} failed: {e}")
         return tool_error(str(e))
