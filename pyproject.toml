@@ -1,0 +1,21 @@
+[project]
+name = "pythonmcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Kaden", email = "kadenmsapp@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "keyring>=25.7.0",
+    "mcp[cli]>=2.3.0",
+]
+
+[project.scripts]
+pythonmcp = "pythonmcp:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"

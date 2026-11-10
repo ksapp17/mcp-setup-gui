@@ -1,0 +1,104 @@
+{
+  "name": "weather",
+  "responseByteCap": 50000,
+  "apis": [
+    {
+      "id": "openweather",
+      "baseUrl": "https://api.openweathermap.org/data/2.5",
+      "auth": {
+        "secretRef": "secret://weather/openweather/apiKey",
+        "placement": {
+          "in": "query",
+          "name": "appid"
+        }
+      },
+      "tools": [
+        {
+          "name": "get_current_weather",
+          "description": "Current weather for a city. Use when the user asks what the weather is like right now.",
+          "method": "GET",
+          "path": "/weather",
+          "paramLocations": {
+            "q": "query",
+            "units": "query"
+          },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "type": "string",
+                "description": "City name, optionally with country code, e.g. Boise,US"
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "imperial",
+                  "metric"
+                ],
+                "description": "imperial for °F, metric for °C. Use imperial unless the user asks for metric."
+              }
+            },
+            "required": [
+              "q",
+              "units"
+            ]
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        },
+        {
+          "name": "get_forecast",
+          "description": "5-day forecast in 3-hour steps for a city. Use for questions about upcoming weather.",
+          "method": "GET",
+          "path": "/forecast",
+          "paramLocations": {
+            "q": "query",
+            "units": "query",
+            "cnt": "query"
+          },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "type": "string",
+                "description": "City, e.g. Boise,US"
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "imperial",
+                  "metric"
+                ],
+                "description": "imperial for °F, metric for °C. Use imperial unless the user asks for metric."
+              },
+              "cnt": {
+                "type": "integer",
+                "description": "Number of 3-hour steps, max 40"
+              }
+            },
+            "required": [
+              "q",
+              "units"
+            ]
+          },
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "client": "claude-desktop",
+      "configPath": "C:\\Users\\PC\\AppData\\Local\\Claude-Data\\claude_pzs8sxrjxfjjc\\claude_desktop_config.json",
+      "serverName": "weather",
+      "backupPath": "C:\\Users\\PC\\.mcpgui\\backups\\claude_desktop_config.20261110-110403.json",
+      "status": "registered",
+      "registeredAt": "2026-11-10T11:04:03"
+    }
+  ]
+}
