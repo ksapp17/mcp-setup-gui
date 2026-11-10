@@ -4,7 +4,7 @@ Turn an HTTP API into tools Claude can use, without writing server code or hand-
 
 You describe an API in `project.json`. A generic MCP runtime serves every endpoint you list as a tool, and an installer registers it with Claude Desktop safely: it verifies the server first, shows a diff, backs up the config, and can undo the change.
 
-**Status:** milestones 1 to 3 of 7 work, with a browser UI: local stdio servers for Claude Desktop, API-key and bearer auth, import from OpenAPI specs, and a built-in tool tester. Remote deployment, OAuth and more clients are planned (see [Roadmap](#roadmap)).
+**Status:** milestones 1 to 4 of 7 work, with a browser UI: local stdio servers for Claude Desktop and Claude Code, API-key and bearer auth, import from OpenAPI specs, and a built-in tool tester. Remote deployment, OAuth and more clients are planned (see [Roadmap](#roadmap)).
 
 ```
 project.json ──► runtime.py ──stdio──► Claude Desktop ──► Claude
@@ -32,6 +32,7 @@ It opens a page in your browser where you can:
 - **Turn tools on and off** and edit descriptions later
 - **Test a tool**: run it the way Claude Desktop does and see the response, the raw MCP result and the runtime's log
 - **Install or remove** the project in Claude Desktop, after a preview of the exact change to the config file
+- **Register it with Claude Code** in user, local or project scope, after a preview of the exact command
 
 The UI is plain HTML forms served by Python. It listens on `127.0.0.1` only, and the terminal prints a one-time link that signs your browser in. It uses the same code as the command-line tools below, so you can mix the two.
 
@@ -67,6 +68,24 @@ uv run install.py add --project project.json
 
 **4. Reopen Claude Desktop** and ask: *"What's the weather in Boise this weekend?"*
 
+## Claude Code
+
+```powershell
+uv run install.py add --project project.json --client claude-code                       # every project (user scope)
+uv run install.py add --project project.json --client claude-code --scope local --folder C:\code\my-repo
+uv run install.py remove --project project.json --client claude-code
+```
+
+This goes through Claude Code's own `claude mcp add` and `claude mcp remove` instead of editing its files, because `~/.claude.json` holds all of Claude Code's state and is rewritten while it runs. The installer verifies the runtime first, shows the exact command, replaces its own earlier registration in the same scope, and refuses to overwrite a server it didn't create.
+
+| Scope | Where it applies | Stored in |
+| --- | --- | --- |
+| `user` (default) | Every project on this machine | `~/.claude.json` |
+| `local` | One folder, only you | `~/.claude.json`, keyed by the folder |
+| `project` | One folder, shared through git | `.mcp.json` in that folder |
+
+Project scope writes this machine's absolute paths into a file meant to be committed, so teammates would need the same paths. Prefer `user` or `local`. Start a new Claude Code session and run `/mcp` to check the server.
+
 ## Import any API from its OpenAPI spec
 
 ```powershell
@@ -95,6 +114,7 @@ After importing, read the tool descriptions in the project file. The importer li
 | --- | --- |
 | `uv run install.py add --project project.json` | Verify and register the project with Claude Desktop |
 | `uv run install.py remove --project project.json` | Remove the entry this installer added |
+| `uv run install.py add --project project.json --client claude-code` | Register with Claude Code (see above) |
 | `uv run install.py list` | Show every MCP server in each Claude Desktop config found |
 | `uv run gui.py` | Open the browser UI (`--no-browser` to just print the link) |
 | `uv run import_openapi.py SPEC --out project.json` | Turn an OpenAPI spec into tools (see above) |
@@ -172,6 +192,8 @@ Adding a tool is a JSON edit and a Claude Desktop restart. No code changes.
 
 **The server shows as failed.** Read its log. The runtime writes errors to stderr, which Claude Desktop records per server (`mcp-server-<name>.log`).
 
+**The UI says Claude Code isn't available.** The `claude` command has to be on PATH for the terminal that runs `gui.py`. Open a new terminal after installing Claude Code.
+
 **Changes don't show up.** Claude Desktop only reads the config at startup, and closing the window leaves it running in the tray. Quit it fully.
 
 ## Built with
@@ -183,7 +205,7 @@ Python 3.13, [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk
 1. ~~Thin slice: one API, API-key auth, local stdio, Claude Desktop~~
 2. ~~OpenAPI import: generate `project.json` from a spec, pick operations, edit descriptions~~
 3. ~~Built-in tester: call each tool from the UI and see the raw result~~
-4. Claude Code adapter
+4. ~~Claude Code adapter~~
 5. Remote deployment: Streamable HTTP, Docker, static bearer auth
 6. OAuth upstream and inbound
 7. MCP Registry servers, more clients, MCPB export

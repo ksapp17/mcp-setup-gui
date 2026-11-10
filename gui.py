@@ -16,6 +16,7 @@ import hashlib
 import html
 import json
 import secrets
+import shutil
 import socket
 import sys
 import tempfile
@@ -37,6 +38,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from starlette.routing import Route
 
+import claude_code
 import import_openapi as importer
 import install as installer
 
@@ -490,8 +492,41 @@ async def show_project(request):
   <p class="muted">Quit Claude Desktop before writing. It saves its own settings to the same file.</p>
   <button name="action" value="add">Preview install</button>
   <button class="secondary" name="action" value="remove">Preview removal</button>
-</form>"""
+</form>
+
+<h2>Claude Code</h2>
+{code_card(rel, data)}"""
     return page(data["name"], body, request)
+
+
+def code_card(rel, data):
+    recorded = [c for c in data.get("clients", []) if c.get("client") == claude_code.CLIENT_ID]
+    status = "".join(
+        f'<span class="tag ok">{e(c["scope"])} scope'
+        + (f': {e(c["folder"])}' if c.get("folder") else ": all projects") + "</span>"
+        for c in recorded) or '<span class="tag">Not registered</span>'
+    if not shutil.which("claude"):
+        return (f'<div class="card">{status}<p class="muted">The <code>claude</code> command isn\'t on PATH, '
+                "so Claude Code can't be set up from here. Install Claude Code, then restart gui.py.</p></div>")
+    last = recorded[-1] if recorded else {}
+    options = "".join(
+        f'<option value="{s}" {"selected" if last.get("scope", "user") == s else ""}>{label}</option>'
+        for s, label in (("user", "user: every project on this machine"),
+                         ("local", "local: one folder, only you"),
+                         ("project", "project: one folder, shared via .mcp.json")))
+    return f"""
+<form class="card" method="post" action="/code/preview">
+  <input type="hidden" name="file" value="{e(rel)}">
+  <div>{status}</div>
+  <div class="row">
+    <div><label>Scope</label><select name="scope">{options}</select></div>
+    <div><label>Project folder <span class="muted">(local and project scope only)</span></label>
+      <input type="text" name="folder" value="{e(last.get("folder") or "")}" placeholder="C:\\Users\\you\\code\\my-repo"></div>
+  </div>
+  <p class="muted">Runs Claude Code's own <code>claude mcp add</code> / <code>remove</code>. New Claude Code sessions pick it up.</p>
+  <button name="action" value="add">Preview install</button>
+  <button class="secondary" name="action" value="remove">Preview removal</button>
+</form>"""
 
 
 @handled
@@ -701,6 +736,95 @@ async def apply_change(request):
     return go("/project", file=rel, msg=msg)
 
 
+# ------------------------------------------------------------- claude code ---
+
+def code_target(form):
+    scope = form.get("scope", "user")
+    folder = form.get("folder", "").strip().strip('"') or None
+    cwd = claude_code.check_target(scope, folder)  # validates scope and folder
+    return scope, (None if scope == "user" else str(cwd)), cwd
+
+
+@handled
+async def code_preview(request):
+    form = await request.form()
+    action = "remove" if form.get("action") == "remove" else "add"
+    rel = form.get("file", "")
+    path, data = open_project(rel)
+    name = data["name"]
+    scope, folder, cwd = code_target(form)
+
+    tools_html = ""
+    if action == "add":
+        await run_in_threadpool(installer.check_project, path)
+        tools = await run_in_threadpool(installer.verify_runtime, path)
+        items = "".join(f"<li><b>{e(t.name)}</b>: {e(t.description or '')}</li>" for t in tools)
+        tools_html = f'<div class="card"><b>Runtime started. Claude will get {len(tools)} tool(s):</b><ul>{items}</ul></div>'
+
+    existing = await run_in_threadpool(claude_code.get, name, cwd)
+    notes = [f'<div class="msg error">{e(w)}</div>' for w in claude_code.warnings_for(scope)] if action == "add" else []
+    replace_box = ""
+    if existing:
+        mine = claude_code.is_ours(existing)
+        notes.append(f'<div class="card"><b>Claude Code already has a server named {e(name)}'
+                     f'{"" if mine else ", not created by this tool"}:</b><pre>{e(existing)}</pre></div>')
+        if action == "add" and not mine:
+            replace_box = ('<label><input type="checkbox" name="replace" value="1"> '
+                           f'Replace it if it\'s in the {e(scope)} scope</label>')
+    elif action == "remove":
+        notes.append(f'<div class="msg error">Claude Code has no server named {e(name)} here. '
+                     "Nothing to remove.</div>")
+
+    args = (claude_code.add_args(name, path, scope) if action == "add"
+            else claude_code.remove_args(name, scope))
+    can_run = action == "add" or existing
+    confirm = f"""
+<form method="post" action="/code/apply">
+  <input type="hidden" name="file" value="{e(rel)}"><input type="hidden" name="action" value="{action}">
+  <input type="hidden" name="scope" value="{e(scope)}"><input type="hidden" name="folder" value="{e(folder or "")}">
+  {replace_box}
+  <button class="{"danger" if action == "remove" else ""}">{"Install" if action == "add" else "Remove"}: run this command</button>
+</form>""" if can_run else ""
+
+    where = "every project" if scope == "user" else f"<code>{e(folder)}</code>"
+    body = f"""
+<h1>{"Install" if action == "add" else "Remove"} {e(name)} in Claude Code</h1>
+<p class="sub">{e(scope)} scope · {where} · <a href="/project?{urlencode({"file": rel})}">Back</a></p>
+{tools_html}{"".join(notes)}
+<h2>Command</h2><pre>{e(claude_code.display(args))}</pre>
+{confirm}"""
+    return page("Claude Code", body, request)
+
+
+@handled
+async def code_apply(request):
+    form = await request.form()
+    action = "remove" if form.get("action") == "remove" else "add"
+    rel = form.get("file", "")
+    path, data = open_project(rel)
+    name = data["name"]
+    scope, folder, cwd = code_target(form)
+
+    if action == "add":
+        await run_in_threadpool(installer.check_project, path)
+        output = await run_in_threadpool(claude_code.add, name, path, scope, folder, form.get("replace") == "1")
+        record = {"client": claude_code.CLIENT_ID, "configPath": claude_code.registration_key(scope, folder),
+                  "scope": scope, "folder": folder, "serverName": name, "status": "registered",
+                  "registeredAt": datetime.now().isoformat(timespec="seconds")}
+        msg = "Registered with Claude Code. Start a new session and run /mcp to check it."
+        if scope == "project":
+            msg += " Claude Code will ask you to approve it."
+    else:
+        output = await run_in_threadpool(claude_code.remove, name, scope, folder)
+        record = {"client": claude_code.CLIENT_ID, "configPath": claude_code.registration_key(scope, folder),
+                  "status": "removed"}
+        msg = "Removed from Claude Code."
+    _, fresh = open_project(rel)
+    installer.record_registration(path, fresh, record)
+    last_line = output.strip().splitlines()[0] if output.strip() else ""
+    return go("/project", file=rel, msg=f"{msg} ({last_line})" if last_line else msg)
+
+
 # --------------------------------------------------------------------- app ---
 
 @handled
@@ -720,6 +844,8 @@ app = Starlette(
         Route("/test", test_tool, methods=["POST"]),
         Route("/install/preview", preview_change, methods=["POST"]),
         Route("/install/apply", apply_change, methods=["POST"]),
+        Route("/code/preview", code_preview, methods=["POST"]),
+        Route("/code/apply", code_apply, methods=["POST"]),
     ],
     middleware=[Middleware(BaseHTTPMiddleware, dispatch=guard)],
 )

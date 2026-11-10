@@ -1,16 +1,23 @@
-"""Installer: registers a project's runtime with Claude Desktop.
+"""Installer: registers a project's runtime with Claude Desktop or Claude Code.
 
 Usage (from the project folder):
     uv run install.py add     --project project.json
     uv run install.py remove  --project project.json
     uv run install.py list
 
+    uv run install.py add    --project project.json --client claude-code [--scope user|local|project] [--folder DIR]
+    uv run install.py remove --project project.json --client claude-code
+
 Options:
-    --config PATH   use this claude_desktop_config.json instead of searching
+    --client NAME   claude-desktop (default) or claude-code
+    --config PATH   Claude Desktop: use this claude_desktop_config.json instead of searching
+    --scope SCOPE   Claude Code: user (default, every project), local or project (one folder)
+    --folder DIR    Claude Code: the project folder, for local and project scope
     --yes           don't ask for confirmation
     --skip-verify   don't start the runtime to check it before installing
 
-What "add" does, in order:
+Claude Code registrations go through Claude Code's own `claude mcp add` and
+`claude mcp remove` (see claude_code.py). What "add" does for Claude Desktop, in order:
   1. Checks project.json and that every secret it needs is in the keychain
   2. Starts the runtime and lists its tools, so you see what Claude will get
   3. Finds Claude Desktop's config file (it isn't always where the docs say)
@@ -248,8 +255,9 @@ def write_config(config_path, original_text, new_config):
 
 
 def record_registration(project_path, project, record):
+    client = record.get("client", CLIENT_ID)
     clients = [c for c in project.get("clients", [])
-               if not (c.get("client") == CLIENT_ID and c.get("configPath") == record.get("configPath"))]
+               if not (c.get("client") == client and c.get("configPath") == record.get("configPath"))]
     if record.get("status") == "registered":
         clients.append(record)
     project["clients"] = clients
@@ -370,6 +378,70 @@ def cmd_remove(opts):
     restart_hint()
 
 
+def cmd_add_code(opts):
+    import claude_code
+
+    project_path = Path(opts.project).resolve()
+    project = check_project(project_path)
+    name = project["name"]
+    print(f"Project '{name}' OK, secrets found in the keychain.")
+    if not opts.skip_verify:
+        print("Starting the runtime to check it...")
+        tools = verify_runtime(project_path)
+        print(f"Runtime OK. Claude will get {len(tools)} tool(s):")
+        for t in tools:
+            print(f"  - {t.name}: {t.description}")
+
+    scope = opts.scope or "user"
+    cwd = claude_code.check_target(scope, opts.folder)
+    print(f"\nClaude Code, {scope} scope" + ("" if scope == "user" else f", folder {cwd}"))
+    for warning in claude_code.warnings_for(scope):
+        print(f"Warning: {warning}")
+    print("Will run:\n  " + claude_code.display(claude_code.add_args(name, project_path, scope)))
+    if not confirm("\nRun it?", opts.yes):
+        raise InstallError("Cancelled. Nothing was changed.")
+
+    print(claude_code.add(name, project_path, scope, opts.folder))
+    record_registration(project_path, project, {
+        "client": claude_code.CLIENT_ID,
+        "configPath": claude_code.registration_key(scope, opts.folder),
+        "scope": scope,
+        "folder": None if scope == "user" else str(cwd),
+        "serverName": name,
+        "status": "registered",
+        "registeredAt": datetime.now().isoformat(timespec="seconds"),
+    })
+    print("\nDone. Start a new Claude Code session and run /mcp to see it."
+          + (" Claude Code will ask you to approve project-scope servers." if scope == "project" else ""))
+
+
+def cmd_remove_code(opts):
+    import claude_code
+
+    project_path = Path(opts.project).resolve()
+    project = read_json(project_path)
+    name = project["name"]
+
+    scope, folder = opts.scope, opts.folder
+    if not scope:  # fall back to what was recorded at install time
+        recorded = [c for c in project.get("clients", []) if c.get("client") == claude_code.CLIENT_ID]
+        if len(recorded) != 1:
+            raise InstallError("Pass --scope (and --folder for local or project scope): "
+                               + ("no Claude Code registration is recorded."
+                                  if not recorded else "this project is registered in more than one place."))
+        scope, folder = recorded[0]["scope"], recorded[0].get("folder")
+
+    print("Will run:\n  " + claude_code.display(claude_code.remove_args(name, scope)))
+    if not confirm("Run it?", opts.yes):
+        raise InstallError("Cancelled. Nothing was changed.")
+    print(claude_code.remove(name, scope, folder))
+    record_registration(project_path, project, {
+        "client": claude_code.CLIENT_ID,
+        "configPath": claude_code.registration_key(scope, folder),
+        "status": "removed",
+    })
+
+
 def cmd_list(opts):
     paths = [Path(opts.config)] if opts.config else candidate_configs()
     if not paths:
@@ -390,13 +462,17 @@ def cmd_list(opts):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Register an MCP project with Claude Desktop")
+    parser = argparse.ArgumentParser(description="Register an MCP project with Claude Desktop or Claude Code")
     sub = parser.add_subparsers(dest="command", required=True)
 
     for cmd in ("add", "remove"):
         p = sub.add_parser(cmd)
         p.add_argument("--project", required=True, help="Path to project.json")
-        p.add_argument("--config", help="Path to claude_desktop_config.json")
+        p.add_argument("--client", choices=["claude-desktop", "claude-code"], default="claude-desktop")
+        p.add_argument("--config", help="Claude Desktop: path to claude_desktop_config.json")
+        p.add_argument("--scope", choices=["user", "local", "project"],
+                       help="Claude Code: where to register (default: user)")
+        p.add_argument("--folder", help="Claude Code: project folder for local or project scope")
         p.add_argument("--yes", action="store_true", help="Don't ask for confirmation")
         if cmd == "add":
             p.add_argument("--skip-verify", action="store_true", help="Don't test-start the runtime")
@@ -405,9 +481,16 @@ def main():
     p.add_argument("--config", help="Path to claude_desktop_config.json")
 
     opts = parser.parse_args()
+    # When this file runs as a script it is __main__, and claude_code imports it again as
+    # "install", so its InstallError is a second class with the same name. Catch both.
+    import claude_code
+    errors = (InstallError, claude_code.InstallError)
     try:
-        {"add": cmd_add, "remove": cmd_remove, "list": cmd_list}[opts.command](opts)
-    except InstallError as e:
+        if opts.command in ("add", "remove") and opts.client == "claude-code":
+            {"add": cmd_add_code, "remove": cmd_remove_code}[opts.command](opts)
+        else:
+            {"add": cmd_add, "remove": cmd_remove, "list": cmd_list}[opts.command](opts)
+    except errors as e:
         print(f"\nError: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
