@@ -523,8 +523,9 @@ def remote_card(rel, data):
 
     env_rows = "".join(f"<tr><td><code>{e(n)}</code></td><td>{e(w)}</td></tr>" for n, _, w in remote.host_env(data))
     docker = "\n".join(remote.docker_commands(data, rel))
-    local_try = (f"uv run remote.py serve --project {rel}\n"
-                 "cloudflared tunnel --url http://127.0.0.1:8000")
+    local_try = ("cloudflared tunnel --url http://127.0.0.1:8000\n"
+                 "   (save the https URL it prints, plus /mcp, in step 3; then:)\n"
+                 f"uv run remote.py serve --project {rel}")
 
     tool_options = "".join(f'<option value="{e(t["name"])}">{e(t["name"])}</option>'
                            for a in data["apis"] for t in a.get("tools", []) if t.get("enabled", True))
@@ -565,10 +566,13 @@ def remote_card(rel, data):
 </form></div>
 <div class="card"><b>5. Connect Claude</b>
 {local_note}
-<p><b>claude.ai, Claude mobile and Claude Desktop:</b> in claude.ai open Settings, Connectors, Add custom connector.
-Enter the URL <code>{e(url)}</code>. Under Authentication choose <b>No sign-in</b>. Under Request headers add
-<code>x-api-key</code> with your token as the value (use Show token above), or <code>Authorization</code> with
-<code>Bearer &lt;your token&gt;</code> if that name is selectable. Connectors you add there also appear in the mobile apps
+<p><b>claude.ai, Claude mobile and Claude Desktop</b>, with sign-in (works in every account): run the server with
+OAuth on, which <code>remote.py serve</code> does using the URL saved above. In claude.ai open Settings, Connectors,
+Add custom connector, and enter <code>{e(url)}</code>. Keep Authentication on <b>Sign in now</b>, choose
+<b>dynamic client registration</b> (DCR) for the OAuth client, then Add and Connect. Your server's sign-in page opens:
+paste your token (Show token above) and click Allow.</p>
+<p><b>Or with a header</b> (only in accounts with the Request headers beta): Authentication <b>No sign-in</b>, then
+Request headers <code>x-api-key</code> with your token as the value. Connectors you add there also appear in the mobile apps
 and in Claude Desktop. Request headers are a beta and may not show in every account yet; OAuth (milestone 6) is the
 alternative.</p>
 </div>
@@ -579,13 +583,14 @@ alternative.</p>
 <div>{token_html}</div></div>
 
 <div class="card"><b>2. Run it somewhere public</b>
-<p class="muted">The server needs these environment variables. <code>uv run remote.py env --project {e(rel)} --values</code>
+<p class="muted">The server needs these environment variables. If you change the URL (a new tunnel, a new host),
+update <code>MCP_PUBLIC_URL</code> and restart the server, since sign-in links point at it. <code>uv run remote.py env --project {e(rel)} --values</code>
 prints their values for pasting into a host's secret settings.</p>
 <table><tr><th>Variable</th><th>What it is</th></tr>{env_rows}</table>
 <p><b>Any host that runs containers</b> (Render, Railway, Fly.io, a VPS) using the Dockerfile in this folder:</p>
 <pre>{e(docker)}</pre>
 <p><b>Or try it from this PC first</b> with a free Cloudflare quick tunnel, which gives you a temporary
-https URL. Run each in its own terminal; the tunnel prints the URL. Stop both when you're done.</p>
+https URL. Start the tunnel first, since sign-in needs its URL. Run each in its own terminal and stop both when you're done.</p>
 <pre>{e(local_try)}</pre></div>
 
 <div class="card"><b>3. Server URL</b>
@@ -996,6 +1001,7 @@ async def remote_token(request):
 <p>{e(note)}</p>
 <ul>
   <li>On the host: set <code>{e(remote.BEARER_ENV)}</code> to this value.</li>
+  <li>On your server's sign-in page (when claude.ai connects with Sign in now): paste this value and click Allow.</li>
   <li>In claude.ai's Add custom connector: Authentication <b>No sign-in</b>, then Request headers <code>x-api-key</code> = this value.</li>
   <li>For Claude Code and other clients: header <code>Authorization</code> = <code>Bearer</code> followed by this value.</li>
 </ul>

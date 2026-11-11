@@ -5,6 +5,7 @@ Local (Claude Desktop / Claude Code start it themselves, over stdio):
 
 Remote (Streamable HTTP at /mcp, for claude.ai, mobile, and remote connectors):
     MCP_BEARER_TOKEN=... uv run runtime.py --project project.json --http --host 0.0.0.0 --port 8000
+    Add --public-url https://your-host (or MCP_PUBLIC_URL) to turn on OAuth sign-in (oauth.py).
 
 Secrets: for each secret://<account> ref the runtime reads the environment variable
 MCP_SECRET_<ACCOUNT> first (servers have no OS keychain), then the OS keychain.
@@ -242,14 +243,19 @@ class BearerGate:
                                           may be reserved for OAuth)
     OAuth comes in milestone 6."""
 
-    def __init__(self, app, token):
+    def __init__(self, app, token, oauth=False):
         self.app = app
         self.token = token.encode() if token else None
+        self.oauth = oauth  # with OAuth on, the SDK checks tokens and answers 401 with sign-in details
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             if scope["path"] == "/health":
                 return await self.respond(send, 200, b"ok", b"text/plain")
+            if self.oauth:
+                if scope["path"] == "/mcp":
+                    scope = self.translate_api_key(scope)
+                return await self.app(scope, receive, send)
             if self.token is not None:
                 headers = dict(scope.get("headers") or [])
                 # Constant-time comparisons, both always evaluated
@@ -259,6 +265,16 @@ class BearerGate:
                     return await self.respond(send, 401, b'{"error":"unauthorized"}', b"application/json",
                                               [(b"www-authenticate", b"Bearer")])
         await self.app(scope, receive, send)
+
+    def translate_api_key(self, scope):
+        """X-API-Key: <token> becomes Authorization: Bearer <token>, which the SDK's checks accept."""
+        headers = list(scope.get("headers") or [])
+        given = dict(headers).get(b"x-api-key")
+        if given and hmac.compare_digest(given, self.token):
+            headers = [(k, v) for k, v in headers if k != b"authorization"]
+            headers.append((b"authorization", b"Bearer " + self.token))
+            scope = {**scope, "headers": headers}
+        return scope
 
     @staticmethod
     async def respond(send, status, body, content_type, extra=()):
@@ -277,7 +293,7 @@ def is_loopback(host):
         return False
 
 
-def serve_http(server, host, port, token):
+def serve_http(server, host, port, token, public_url=None, server_name="mcp"):
     import uvicorn
     from mcp.server.transport_security import TransportSecuritySettings
 
@@ -290,9 +306,44 @@ def serve_http(server, host, port, token):
 
     # Stateless: every request stands alone (MCP spec 2026-07-28), so any number of copies
     # can run behind a load balancer and nothing breaks when one restarts.
-    app = server.streamable_http_app(stateless_http=True, json_response=True, host=host,
-                                     transport_security=security)
-    uvicorn.run(BearerGate(app, token), host=host, port=port, log_level="warning")
+    options = dict(stateless_http=True, json_response=True, host=host, transport_security=security)
+
+    if public_url:
+        # OAuth sign-in (claude.ai "Sign in now"). The SDK serves the OAuth endpoints and
+        # metadata; oauth.py supplies stateless storage and the /login page.
+        import oauth
+        from mcp.server.auth.provider import ProviderTokenVerifier
+        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+
+        resource = public_url + "/mcp"
+        provider = oauth.OwnerOAuthProvider(token, public_url, resource, server_name)
+        options.update(
+            auth=AuthSettings(
+                issuer_url=public_url,
+                resource_server_url=resource,
+                client_registration_options=ClientRegistrationOptions(
+                    enabled=True, valid_scopes=[oauth.SCOPE], default_scopes=[oauth.SCOPE]),
+                validate_token_resource=True,  # tokens only work for this server (RFC 8707)
+            ),
+            token_verifier=ProviderTokenVerifier(provider),
+            auth_server_provider=provider,
+            custom_starlette_routes=provider.login_routes(),
+        )
+
+    app = server.streamable_http_app(**options)
+    uvicorn.run(BearerGate(app, token, oauth=bool(public_url)), host=host, port=port, log_level="warning")
+
+
+def check_public_url(url):
+    url = url.strip().rstrip("/")
+    if url.endswith("/mcp"):
+        url = url[:-4]
+    parts = urlsplit(url)
+    if parts.scheme != "https" and not (parts.scheme == "http" and is_loopback(parts.hostname or "")):
+        raise SystemExit("--public-url must be https:// (http only for 127.0.0.1 or localhost).")
+    if parts.path not in ("", "/"):
+        raise SystemExit("--public-url is the server's base URL, like https://my-server.example.com")
+    return url
 
 
 # -------------------------------------------------------------------- main ---
@@ -306,6 +357,8 @@ def main():
                         help="HTTP port (default: $PORT or 8000)")
     parser.add_argument("--no-auth", action="store_true",
                         help="HTTP without a token, for testing on 127.0.0.1 only")
+    parser.add_argument("--public-url", default=os.environ.get("MCP_PUBLIC_URL", ""),
+                        help="Public base URL (https://...). Turns on OAuth sign-in. Default: $MCP_PUBLIC_URL")
     opts = parser.parse_args()
 
     project = load_project(opts.project)
@@ -330,9 +383,14 @@ def main():
     elif len(token) < MIN_TOKEN_LENGTH:
         raise SystemExit(f"{BEARER_ENV} is too short. Use at least {MIN_TOKEN_LENGTH} random characters.")
 
+    public_url = check_public_url(opts.public_url) if opts.public_url else None
+    if public_url and not token:
+        raise SystemExit("OAuth sign-in needs MCP_BEARER_TOKEN: it's the owner's sign-in secret and signing key.")
+
     log(f"serving {count} tool(s) from project '{project['name']}' at http://{opts.host}:{opts.port}/mcp"
-        + ("" if token else " WITHOUT AUTH (local testing only)"))
-    serve_http(server, opts.host, opts.port, token)
+        + ("" if token else " WITHOUT AUTH (local testing only)")
+        + (f", OAuth sign-in on for {public_url}" if public_url else ""))
+    serve_http(server, opts.host, opts.port, token, public_url, project["name"])
 
 
 if __name__ == "__main__":

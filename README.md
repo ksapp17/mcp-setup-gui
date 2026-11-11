@@ -4,7 +4,7 @@ Turn an HTTP API into tools Claude can use, without writing server code or hand-
 
 You describe an API in `project.json`. A generic MCP runtime serves every endpoint you list as a tool, and an installer registers it with Claude Desktop safely: it verifies the server first, shows a diff, backs up the config, and can undo the change.
 
-**Status:** milestones 1 to 5 of 7 work, with a browser UI: local servers for Claude Desktop and Claude Code, remote servers for claude.ai and mobile, API-key and bearer auth, import from OpenAPI specs, and a built-in tool tester. OAuth and more clients are planned (see [Roadmap](#roadmap)).
+**Status:** milestones 1 to 5 of 7 work, plus the inbound half of 6, with a browser UI: local servers for Claude Desktop and Claude Code, remote servers for claude.ai and mobile with OAuth sign-in, API-key and bearer auth to upstream APIs, import from OpenAPI specs, and a built-in tool tester. Upstream OAuth and more clients are planned (see [Roadmap](#roadmap)).
 
 ```
 project.json ──► runtime.py ──stdio──► Claude Desktop ──► Claude
@@ -98,7 +98,7 @@ uv run remote.py serve --project project.json          # run it on 127.0.0.1:800
 uv run remote.py test --project project.json --url https://your-host/mcp --tool get_current_weather --args '{"q": "Boise,US"}'
 ```
 
-**Try it from your PC first** with a free Cloudflare quick tunnel (install `cloudflared`, no account needed): run `remote.py serve` in one terminal and `cloudflared tunnel --url http://127.0.0.1:8000` in another. The tunnel prints a temporary `https://...trycloudflare.com` URL; add `/mcp` to it.
+**Try it from your PC first** with a free Cloudflare quick tunnel (install `cloudflared`, no account needed): start `cloudflared tunnel --url http://127.0.0.1:8000` in one terminal. It prints a temporary `https://...trycloudflare.com` URL. Then run `uv run remote.py serve --project project.json --public-url https://....trycloudflare.com` in another (or save the URL plus `/mcp` in the GUI and leave `--public-url` out). The connector URL is the tunnel URL plus `/mcp`.
 
 **Deploy** to any host that runs containers (Render, Railway, Fly.io, a VPS) with the included `Dockerfile`:
 
@@ -107,12 +107,19 @@ docker build --build-arg PROJECT=project.json -t mcp-weather .
 docker run --rm -p 8000:8000 -e MCP_BEARER_TOKEN -e MCP_SECRET_WEATHER_OPENWEATHER_APIKEY mcp-weather
 ```
 
-No secret is baked into the image. On a host there's no OS keychain, so the runtime reads each `secret://<account>` from an environment variable named `MCP_SECRET_<ACCOUNT>` (`remote.py env` lists them; `--values` prints the values for pasting into the host's secret settings).
+Set `MCP_PUBLIC_URL` to the host's public base URL to turn on sign-in. No secret is baked into the image. On a host there's no OS keychain, so the runtime reads each `secret://<account>` from an environment variable named `MCP_SECRET_<ACCOUNT>` (`remote.py env` lists them; `--values` prints the values for pasting into the host's secret settings).
 
 **Connect Claude:**
 
-- **claude.ai, mobile and Claude Desktop:** in claude.ai, Settings → Connectors → Add custom connector. Enter the URL and choose **No sign-in** under Authentication (claude.ai otherwise detects the 401 and tries OAuth). Under Request headers add `x-api-key` with the token as the value; `Authorization: Bearer <token>` also works where that name is selectable. Request headers are a beta that may not show in every account yet; OAuth (milestone 6) is the alternative.
+- **claude.ai, mobile and Claude Desktop, with sign-in** (works in every account): run the server with a public URL, which turns on OAuth. In claude.ai, Settings → Connectors → Add custom connector, enter the URL, keep **Sign in now**, and pick **dynamic client registration** for the OAuth client. When you click Connect, your server's own sign-in page opens: paste the token and click Allow.
+- **Or with a header** (accounts with the Request headers beta): choose **No sign-in**, then add the request header `x-api-key` with the token as its value.
 - **Claude Code:** `uv run install.py add --project project.json --client claude-code --url https://your-host/mcp` registers `<name>-remote` with the token as a header.
+
+### How sign-in works
+
+The runtime includes a small OAuth 2.1 authorization server for one owner (`oauth.py`): claude.ai discovers it from the 401 response, registers itself, and sends you to the server's `/login` page, where you approve it by entering the server's token. PKCE, redirect URIs and client credentials are checked by the MCP SDK.
+
+It stores nothing. Registered clients, codes and tokens are signed with a key derived from `MCP_BEARER_TOKEN`, so they survive restarts and redeploys, and replacing the token (`remote.py token --new`) signs every client out at once. Access tokens last an hour and refresh tokens 30 days. Tokens are bound to this server's URL (RFC 8707), and redirect URIs must be `https` or loopback.
 
 ## Import any API from its OpenAPI spec
 
@@ -144,7 +151,7 @@ After importing, read the tool descriptions in the project file. The importer li
 | `uv run install.py remove --project project.json` | Remove the entry this installer added |
 | `uv run install.py add --project project.json --client claude-code` | Register with Claude Code (see above) |
 | `uv run install.py add --project project.json --client claude-code --url URL` | Register a remote server with Claude Code |
-| `uv run remote.py token / env / serve / test` | Remote server helpers (see above) |
+| `uv run remote.py token / env / serve / test` | Remote server helpers (see above); `serve --public-url URL` turns on sign-in |
 | `uv run install.py list` | Show every MCP server in each Claude Desktop config found |
 | `uv run gui.py` | Open the browser UI (`--no-browser` to just print the link) |
 | `uv run import_openapi.py SPEC --out project.json` | Turn an OpenAPI spec into tools (see above) |
@@ -227,6 +234,10 @@ Adding a tool is a JSON edit and a Claude Desktop restart. No code changes.
 
 **A remote test says 401.** The host's `MCP_BEARER_TOKEN` doesn't match the token in your keychain. Run `remote.py token` to see yours, or `--new` to replace it (then update the host and every client).
 
+**claude.ai says it couldn't register with the sign-in service.** The server isn't running with a public URL, so OAuth is off. Restart `remote.py serve` with `--public-url` set to the current tunnel or host URL.
+
+**The sign-in page link is broken.** The public URL changed (a new tunnel) but the server still uses the old one. Restart it with the new URL.
+
 **claude.ai can't connect but Claude Code can.** claude.ai connects from Anthropic's servers, so a `127.0.0.1` URL only works on your PC. Use the tunnel URL or your host's URL.
 
 **Changes don't show up.** Claude Desktop only reads the config at startup, and closing the window leaves it running in the tray. Quit it fully.
@@ -242,7 +253,7 @@ Python 3.13, [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk
 3. ~~Built-in tester: call each tool from the UI and see the raw result~~
 4. ~~Claude Code adapter~~
 5. ~~Remote deployment: Streamable HTTP, Docker, static bearer auth~~
-6. OAuth upstream and inbound
+6. OAuth: ~~inbound sign-in~~; upstream (Google, GitHub as you) still to do
 7. MCP Registry servers, more clients, MCPB export
 
 The browser UI (`gui.py`) gets each of these as it lands.

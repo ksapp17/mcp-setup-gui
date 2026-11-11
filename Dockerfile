@@ -1,7 +1,7 @@
 # Remote MCP server for one project.
 #
 #   docker build --build-arg PROJECT=project.json -t mcp-weather .
-#   docker run --rm -p 8000:8000 -e MCP_BEARER_TOKEN -e MCP_SECRET_WEATHER_OPENWEATHER_APIKEY mcp-weather
+#   docker run --rm -p 8000:8000 -e MCP_BEARER_TOKEN -e MCP_PUBLIC_URL -e MCP_SECRET_WEATHER_OPENWEATHER_APIKEY mcp-weather
 #
 # `uv run remote.py env --project project.json` lists the exact variables a project needs.
 # No secret is baked into the image: the token and API keys arrive as environment variables.
@@ -19,7 +19,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY runtime.py ./
+COPY runtime.py oauth.py ./
 ARG PROJECT=project.json
 COPY ${PROJECT} ./project.json
 

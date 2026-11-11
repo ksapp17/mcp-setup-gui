@@ -8,9 +8,10 @@ Usage (from the project folder):
         List the environment variables the server needs on a host. --values prints the
         secret values too, for pasting into a host's secret settings.
 
-    uv run remote.py serve --project project.json [--port 8000]
+    uv run remote.py serve --project project.json [--port 8000] [--public-url https://...]
         Run the HTTP server on 127.0.0.1 with the token and secrets from your keychain.
         Pair it with a tunnel (e.g. cloudflared) to try it from claude.ai before deploying.
+        --public-url (default: the URL saved for the project) turns on OAuth sign-in.
 
     uv run remote.py test --project project.json --url https://host/mcp [--tool NAME --args JSON]
         Connect to a running remote server, list its tools, optionally call one.
@@ -46,10 +47,18 @@ def create_token(project):
     return token
 
 
+def public_base(project):
+    """The saved server URL without /mcp, or None."""
+    url = (project.get("deployment") or {}).get("url")
+    return url[:-4] if url and url.endswith("/mcp") else url
+
+
 def host_env(project, with_values=False):
     """[(name, value or None, what it is)] for every variable the server needs on a host."""
     rows = [(BEARER_ENV, get_token(project) if with_values else None,
-             "Bearer token clients must send (from remote.py token)")]
+             "The server's token: sign-in secret, signing key, and header token"),
+            ("MCP_PUBLIC_URL", public_base(project) if with_values else None,
+             "Public base URL, like https://my-server.example.com. Turns on OAuth sign-in")]
     for api in project["apis"]:
         auth = api.get("auth")
         if auth:
@@ -119,6 +128,11 @@ def remote_session(url, token, tool=None, arguments=None):
                            "the token in your keychain (remote.py token).")
     if probe.status_code == 404:
         raise InstallError(f"{url} returned 404. The MCP endpoint is at /mcp.")
+    if probe.status_code >= 500:
+        # e.g. Cloudflare's 502/530 when the tunnel is up but nothing answers behind it
+        raise InstallError(f"{url} answered {probe.status_code}: the tunnel or host is up but can't reach "
+                           "your server. Check that remote.py serve (or your container) is running, and "
+                           "that the tunnel URL is the current one: it changes every time cloudflared restarts.")
 
     try:
         return anyio.run(run)
@@ -169,10 +183,17 @@ def cmd_serve(opts):
         raise InstallError("No token yet. Run: uv run remote.py token --project " + opts.project)
     env = dict(os.environ)
     env[BEARER_ENV] = token
+    public = opts.public_url or public_base(project)
+    args = [sys.executable, str(RUNTIME), "--project", str(path), "--http", "--host", "127.0.0.1",
+            "--port", str(opts.port)]
+    if public:
+        args += ["--public-url", public]
     print(f"Serving on http://127.0.0.1:{opts.port}/mcp with your token. Ctrl+C to stop.", file=sys.stderr)
+    if public:
+        print(f"OAuth sign-in is on for {public}. If that's an old tunnel URL, pass --public-url "
+              "with the current one or save it in the GUI.", file=sys.stderr)
     try:
-        subprocess.run([sys.executable, str(RUNTIME), "--project", str(path), "--http",
-                        "--host", "127.0.0.1", "--port", str(opts.port)], env=env)
+        subprocess.run(args, env=env)
     except KeyboardInterrupt:
         pass
 
@@ -199,6 +220,7 @@ def main():
     p = sub.add_parser("token"); p.add_argument("--project", required=True); p.add_argument("--new", action="store_true")
     p = sub.add_parser("env"); p.add_argument("--project", required=True); p.add_argument("--values", action="store_true")
     p = sub.add_parser("serve"); p.add_argument("--project", required=True); p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--public-url", help="Public base URL; turns on OAuth sign-in (default: the saved URL)")
     p = sub.add_parser("test")
     p.add_argument("--project", required=True)
     p.add_argument("--url", required=True, help="Full URL ending in /mcp")
