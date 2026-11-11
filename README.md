@@ -4,7 +4,7 @@ Turn an HTTP API into tools Claude can use, without writing server code or hand-
 
 You describe an API in `project.json`. A generic MCP runtime serves every endpoint you list as a tool, and an installer registers it with Claude Desktop safely: it verifies the server first, shows a diff, backs up the config, and can undo the change.
 
-**Status:** milestones 1 to 6 of 7 work, with a browser UI: local servers for Claude Desktop and Claude Code, remote servers for claude.ai and mobile with OAuth sign-in, API-key, bearer and OAuth auth to upstream APIs, import from OpenAPI specs, and a built-in tool tester. More clients are planned (see [Roadmap](#roadmap)).
+**Status:** milestones 1 to 6 of 7 work, plus installing servers from the MCP Registry, with a browser UI: local servers for Claude Desktop and Claude Code, remote servers for claude.ai and mobile with OAuth sign-in, API-key, bearer and OAuth auth to upstream APIs, import from OpenAPI specs, and a built-in tool tester. More clients are planned (see [Roadmap](#roadmap)).
 
 ```
 project.json ──► runtime.py ──stdio──► Claude Desktop ──► Claude
@@ -152,6 +152,30 @@ The browser UI does the same from the API's card: client ID and secret fields, a
 
 **On a remote server**, sign in on your PC first, then copy the values `remote.py env --values` prints (the token bundle is one JSON value) to the host. Providers like GitHub replace the refresh token every time it's used, so set `MCP_TOKEN_DIR` to a folder on a persistent volume: the runtime saves refreshed tokens there, and they survive restarts. Without it, a restart after the first refresh means signing in again.
 
+## Install servers from the MCP Registry
+
+The [MCP Registry](https://registry.modelcontextprotocol.io) is the official catalog of ready-made MCP servers. In the browser UI, click **install a ready-made server** on the home page, search by name, pick an install option, fill in what the server asks for, preview, and install. Or from the terminal:
+
+```powershell
+uv run registry.py search github
+uv run registry.py show io.github.someone/server      # install options and what each needs
+uv run registry.py install io.github.someone/server   # asks for each setting; secrets are hidden
+uv run registry.py list
+uv run registry.py remove server
+```
+
+| Server type | How it runs | Needs |
+| --- | --- | --- |
+| npm package | `npx -y package@version` | Node.js |
+| PyPI package | `uvx package==version` | uv |
+| Docker image | `docker run -i --rm image` | Docker |
+| NuGet package | `dnx package@version --yes` | .NET 10 SDK |
+| Remote URL | Claude Code by URL; Desktop and claude.ai as a custom connector | nothing |
+
+Packages run through `launch.py`, which reads their API keys from the OS keychain when the client starts them, so the keys stay out of Claude's config files (the usual way puts them there in plain text). Settings that aren't secret are kept in `~/.mcpgui/servers/<name>.json`. Install options are `--client claude-code`, `--option ID` (from `show`) and `--name` (the name in Claude). MCPB bundles and packages that run their own HTTP server aren't supported yet.
+
+The registry checks that a publisher owns the name, not what the code does. Read the source before installing a server, especially one that asks for keys.
+
 ## Import any API from its OpenAPI spec
 
 ```powershell
@@ -184,6 +208,7 @@ After importing, read the tool descriptions in the project file. The importer li
 | `uv run install.py add --project project.json --client claude-code --url URL` | Register a remote server with Claude Code |
 | `uv run remote.py token / env / serve / test` | Remote server helpers (see above); `serve --public-url URL` turns on sign-in |
 | `uv run upstream_oauth.py client-secret / login / status / logout --project project.json` | Sign in to APIs that use OAuth (see above). Add `--api ID` when there's more than one |
+| `uv run registry.py search / show / install / list / remove` | Install ready-made servers from the MCP Registry (see above) |
 | `uv run install.py list` | Show every MCP server in each Claude Desktop config found |
 | `uv run gui.py` | Open the browser UI (`--no-browser` to just print the link) |
 | `uv run import_openapi.py SPEC --out project.json` | Turn an OpenAPI spec into tools (see above) |
@@ -276,6 +301,8 @@ Adding a tool is a JSON edit and a Claude Desktop restart. No code changes.
 
 **The provider says the redirect URI doesn't match.** Register exactly `http://127.0.0.1/callback` (not `localhost`). If the provider wants the port too, set `redirectPort` and register that port.
 
+**A registry server shows as failed in Claude Desktop.** Its log says why. `[launch] ... isn't installed` means the runtime it needs (Node.js, uv, Docker) isn't on PATH: install it and restart Desktop. `Missing secret` means the keychain entry is gone: reinstall the server.
+
 **claude.ai can't connect but Claude Code can.** claude.ai connects from Anthropic's servers, so a `127.0.0.1` URL only works on your PC. Use the tunnel URL or your host's URL.
 
 **Changes don't show up.** Claude Desktop only reads the config at startup, and closing the window leaves it running in the tray. Quit it fully.
@@ -292,6 +319,6 @@ Python 3.13, [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk
 4. ~~Claude Code adapter~~
 5. ~~Remote deployment: Streamable HTTP, Docker, static bearer auth~~
 6. ~~OAuth: inbound sign-in for claude.ai, and upstream sign-in to APIs as you~~
-7. MCP Registry servers, more clients, MCPB export
+7. MCP Registry servers (~~install from the registry~~), more clients, MCPB export
 
 The browser UI (`gui.py`) gets each of these as it lands.

@@ -42,6 +42,7 @@ import claude_code
 import import_openapi as importer
 import install as installer
 import remote
+import registry
 import upstream_oauth as upstream
 
 HERE = Path(__file__).resolve().parent
@@ -250,7 +251,8 @@ async def home(request):
         f'<option value="{e(rel)}">Add to {e(data["name"])} ({e(rel)})</option>' for rel, data in projects)
 
     body = f"""
-<h1>Projects</h1><p class="sub">Each project becomes one MCP server in Claude.</p>
+<h1>Projects</h1><p class="sub">Each project becomes one MCP server in Claude.
+Or <a href="/registry">install a ready-made server from the MCP Registry</a>.</p>
 {table}
 <h2>Import an API</h2>
 <form class="card" method="post" action="/import">
@@ -793,6 +795,211 @@ async def oauth_logout(request):
     return go("/project", file=rel, msg=f"Signed out of {api['id']}. To revoke access too, remove the app on the provider's site.")
 
 
+# ---------------------------------------------------------------- registry ---
+
+PENDING = {}  # preview id -> planned registry install, values (including secrets) held in memory only
+
+
+def registry_kinds(server):
+    kinds = sorted({p.get("registryType", "?") for p in server.get("packages") or []})
+    if server.get("remotes"):
+        kinds.append("remote")
+    return "".join(f'<span class="tag">{e(k)}</span>' for k in kinds) or '<span class="tag bad">nothing to install</span>'
+
+
+def safe_link(url, text):
+    url = str(url or "")
+    if not url.startswith("https://"):
+        return e(text)
+    return f'<a href="{e(url)}" target="_blank" rel="noreferrer noopener">{e(text)}</a>'
+
+
+def installed_html():
+    rows = ""
+    for local, spec in registry.installed():
+        where = ", ".join(c["client"] + (f" ({c['scope']})" if c.get("scope") else "")
+                          for c in spec.get("clients", [])) or "no client"
+        rows += f"""<tr><td><b>{e(local)}</b></td><td><code>{e(spec.get("registryName", ""))}</code> {e(spec.get("version", ""))}</td>
+<td>{e(where)}</td><td><form method="post" action="/registry/remove"><input type="hidden" name="local" value="{e(local)}">
+<button class="secondary" style="margin:0">Remove</button></form></td></tr>"""
+    if not rows:
+        return ""
+    return f"""<h2>Installed from the registry</h2>
+<table><tr><th>Name in Claude</th><th>Server</th><th>Installed in</th><th></th></tr>{rows}</table>"""
+
+
+@handled
+async def registry_search(request):
+    q = request.query_params.get("q", "").strip()
+    results = ""
+    if q:
+        entries, more = await run_in_threadpool(registry.search, q)
+        for entry in entries:
+            srv = entry["server"]
+            flag = "" if registry.status(entry) == "active" else f'<span class="tag warn">{e(registry.status(entry))}</span>'
+            results += f"""<tr><td><a href="/registry/server?{urlencode({"name": srv["name"]})}"><b>{e(srv.get("title") or srv["name"])}</b></a>
+<div class="muted"><code>{e(srv["name"])}</code> {e(srv.get("version", ""))}</div></td>
+<td>{e(registry.short(srv.get("description"), 160))}</td><td>{registry_kinds(srv)}{flag}</td></tr>"""
+        results = (f"<table><tr><th>Server</th><th>Description</th><th>Runs as</th></tr>{results}</table>"
+                   + ('<p class="muted">More results exist: search for something more specific.</p>' if more else "")
+                   if results else '<p class="muted">No servers match. The search looks at server names only.</p>')
+    body = f"""
+<h1>MCP Registry</h1>
+<p class="sub">Ready-made servers from <code>{e(registry.REGISTRY_URL)}</code>. The registry lists them; it doesn't
+review their code. Check who publishes a server before installing it.</p>
+<form method="get" action="/registry" class="card">
+  <label>Search by name</label><input type="text" name="q" value="{e(q)}" placeholder="github, filesystem, postgres..." required>
+  <button>Search</button>
+</form>
+{results}{installed_html()}"""
+    return page("MCP Registry", body, request)
+
+
+def option_form(entry, opt):
+    srv = entry["server"]
+    if "unsupported" in opt:
+        return f'<div class="card"><b>{e(opt["label"])}</b><p class="muted">Not available here: {e(opt["unsupported"])}.</p></div>'
+    fields = ""
+    for f in opt["fields"]:
+        label = (f'{e(f["label"])}{" *" if f["required"] else ""}'
+                 f'{" <span class=\"muted\">(secret, kept in the OS keychain)</span>" if f["secret"] else ""}')
+        desc = f'<div class="muted">{e(f["description"])}</div>' if f["description"] else ""
+        name = "f_" + f["key"]
+        if f["choices"]:
+            opts = "".join(f'<option {"selected" if c == f["default"] else ""}>{e(c)}</option>' for c in f["choices"])
+            if not f["required"]:
+                opts = '<option value=""></option>' + opts
+            control = f'<select name="{e(name)}">{opts}</select>'
+        else:
+            kind = "password" if f["secret"] else "text"
+            value = "" if f["secret"] else e(f["default"])
+            control = (f'<input type="{kind}" name="{e(name)}" value="{value}" autocomplete="off" '
+                       f'placeholder="{e(f["placeholder"])}"{" required" if f["required"] and not f["default"] else ""}>')
+        fields += f"<label>{label}</label>{desc}{control}"
+
+    needs = ""
+    if opt["kind"] == "package":
+        needs = (f'<span class="tag ok">{e(opt["needs"])} found</span>' if opt["found"]
+                 else f'<span class="tag bad">needs {e(opt["needs"])}: not found on PATH</span>')
+        clients = '<option value="claude-desktop">Claude Desktop</option><option value="claude-code">Claude Code (all projects)</option>'
+    else:
+        clients = '<option value="claude-code">Claude Code (all projects)</option>'
+        needs = ('<p class="muted">For Claude Desktop or claude.ai, add the URL as a custom connector instead: '
+                 'Settings → Connectors → Add custom connector.</p>')
+    configs = "".join(f'<option value="{e(str(c))}">{e(str(c))}</option>' for c in installer.candidate_configs())
+    config_field = (f'<label>Claude Desktop config <span class="muted">(Desktop only)</span></label><select name="config">{configs}</select>'
+                    if opt["kind"] == "package" and configs else "")
+    return f"""<form class="card" method="post" action="/registry/preview">
+<b>{e(opt["label"])}</b> {needs}
+<input type="hidden" name="name" value="{e(srv["name"])}"><input type="hidden" name="option" value="{e(opt["id"])}">
+{fields or '<p class="muted">Nothing to fill in.</p>'}
+<div class="row"><div><label>Name in Claude</label><input type="text" name="local" value="{e(registry.server_slug(srv["name"]))}" required></div>
+<div><label>Install in</label><select name="client">{clients}</select></div></div>
+{config_field}
+<button>Preview</button></form>"""
+
+
+@handled
+async def registry_server(request):
+    entry = await run_in_threadpool(registry.fetch, request.query_params.get("name", ""))
+    srv = entry["server"]
+    repo = (srv.get("repository") or {}).get("url")
+    state = registry.status(entry)
+    forms = "".join(option_form(entry, o) for o in registry.options(srv))
+    body = f"""
+<h1>{e(srv.get("title") or srv["name"])}</h1>
+<p class="sub"><code>{e(srv["name"])}</code> {e(srv.get("version", ""))}
+{"" if state == "active" else f'<span class="tag warn">{e(state)}</span>'}
+{(" · source: " + safe_link(repo, repo)) if repo else ""} · <a href="/registry">Back</a></p>
+<p>{e(srv.get("description", ""))}</p>
+<h2>Install options</h2>{forms or '<p class="muted">This server lists no packages or URLs.</p>'}"""
+    return page(srv.get("title") or srv["name"], body, request)
+
+
+@handled
+async def registry_preview(request):
+    form = await request.form()
+    entry = await run_in_threadpool(registry.fetch, form.get("name", ""))
+    opt = registry.find_option(entry["server"], form.get("option"))
+    local = registry.check_local_name(form.get("local", "").strip())
+    client = form.get("client")
+    values = {f["key"]: form.get("f_" + f["key"], "").strip() for f in opt["fields"]}
+
+    if opt["kind"] == "remote":
+        if client != "claude-code":
+            raise UserError("Claude Desktop adds remote servers as connectors: Settings → Connectors → Add custom connector.")
+        spec, headers = registry.plan_remote(entry, opt, values)
+        secrets = {}
+    else:
+        spec, secrets = registry.plan_package(entry, opt, values, local)
+        headers = {}
+
+    pending = {"local": local, "spec": spec, "secrets": secrets, "headers": headers, "client": client}
+    if client == "claude-desktop":
+        config_path = chosen_config(form)
+        original_text, config, new_config = await run_in_threadpool(registry.desktop_change, local, config_path)
+        pending.update(config_path=config_path, digest=text_hash(original_text))
+        change = f"<h2>Change to <code>{e(config_path.name)}</code></h2><pre>{e(installer.diff_text(config, new_config, config_path.name))}</pre>"
+        if installer.desktop_is_running():
+            change = ('<div class="msg error">Claude Desktop is running. Quit it first (tray icon, Quit), '
+                      'or it may overwrite this change.</div>') + change
+    elif client == "claude-code":
+        change = f"<h2>Command</h2><pre>{e(claude_code.display(registry.code_args(local, spec, {k: '••••••••' for k in headers}, 'user')))}</pre>"
+        if headers:
+            change += '<div class="msg error">Claude Code keeps these headers in its own config file, in plain text.</div>'
+    else:
+        raise UserError("Pick where to install it.")
+
+    launch = ""
+    if "remote" not in spec:
+        launch = (f"<h2>What will run</h2><p class=\"muted\">launch.py reads the secrets from the keychain and starts:</p>"
+                  f"<pre>{e(' '.join(str(a) if isinstance(a, str) else '<secret>' for a in [spec['command'], *spec['args']]))}</pre>"
+                  f"<p class=\"muted\">Plain settings: {e(json.dumps(spec['env'])) if spec['env'] else 'none'} · "
+                  f"secrets: {e(', '.join(spec['secretEnv']) or 'none')}</p>")
+    pid = uuid.uuid4().hex
+    PENDING.clear()  # one install at a time; nothing secret lingers
+    PENDING[pid] = pending
+    body = f"""
+<h1>Install {e(local)}</h1>
+<p class="sub"><code>{e(spec["registryName"])}</code> {e(spec["version"])} · {e(spec["option"])} ·
+<a href="/registry/server?{urlencode({"name": spec["registryName"]})}">Back</a></p>
+{launch}{change}
+<form method="post" action="/registry/apply"><input type="hidden" name="id" value="{pid}">
+<button>Install</button> <span class="muted">Secrets go to the keychain; the config file is backed up first.</span></form>"""
+    return page(f"Install {local}", body, request)
+
+
+@handled
+async def registry_apply(request):
+    form = await request.form()
+    pending = PENDING.pop(form.get("id", ""), None)
+    if not pending:
+        raise UserError("That preview has expired. Preview again.")
+    local, spec = pending["local"], pending["spec"]
+    if pending["client"] == "claude-desktop":
+        config_path = pending["config_path"]
+        original_text, config, new_config = await run_in_threadpool(registry.desktop_change, local, config_path)
+        if not same(text_hash(original_text), pending["digest"]):
+            raise UserError("The config file changed after the preview (Claude Desktop may have saved it). "
+                            "Nothing was written. Preview again.")
+        backup = await run_in_threadpool(registry.install_desktop, local, spec, pending["secrets"],
+                                         config_path, original_text, new_config)
+        msg = f"Installed {local} in Claude Desktop. Restart Desktop to load it. Backup: {backup}"
+    else:
+        await run_in_threadpool(registry.install_code, local, spec, pending["secrets"],
+                                pending["headers"], "user", None)
+        msg = f"Installed {local} in Claude Code. Start a new Claude Code session to load it."
+    return go("/registry", msg=msg)
+
+
+@handled
+async def registry_remove(request):
+    form = await request.form()
+    local = registry.check_local_name(form.get("local", ""))
+    notes = await run_in_threadpool(registry.remove, local)
+    return go("/registry", msg=" ".join(notes + [f"Removed {local} and deleted its secrets."]))
+
+
 # -------------------------------------------------------------------- test ---
 
 def run_tool(project_path, tool_name, arguments):
@@ -1184,6 +1391,11 @@ app = Starlette(
         Route("/project", show_project),
         Route("/project/save", save_project, methods=["POST"]),
         Route("/secret", store_secret, methods=["POST"]),
+        Route("/registry", registry_search),
+        Route("/registry/server", registry_server),
+        Route("/registry/preview", registry_preview, methods=["POST"]),
+        Route("/registry/apply", registry_apply, methods=["POST"]),
+        Route("/registry/remove", registry_remove, methods=["POST"]),
         Route("/oauth/client", oauth_client, methods=["POST"]),
         Route("/oauth/start", oauth_start, methods=["POST"]),
         Route("/oauth/logout", oauth_logout, methods=["POST"]),
