@@ -9,6 +9,9 @@ Remote (Streamable HTTP at /mcp, for claude.ai, mobile, and remote connectors):
 
 Secrets: for each secret://<account> ref the runtime reads the environment variable
 MCP_SECRET_<ACCOUNT> first (servers have no OS keychain), then the OS keychain.
+APIs that use OAuth (upstream_oauth.py) store a token bundle there instead of a key;
+the runtime refreshes it and saves rotated tokens back. On a host, set MCP_TOKEN_DIR
+to a writable folder so refreshed tokens survive restarts.
 
 Nothing in here knows about any particular API. Add a tool to project.json,
 restart the client, and it shows up. No code changes.
@@ -26,6 +29,7 @@ from urllib.parse import quote, urlsplit
 
 import anyio
 import httpx
+from upstream_oauth import OAuthError, TokenSource, check_config, dump_bundle, oauth_config
 from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -40,6 +44,7 @@ from mcp.types import (
 KEYCHAIN_SERVICE = "mcp-setup-gui"
 SECRET_ENV_PREFIX = "MCP_SECRET_"
 BEARER_ENV = "MCP_BEARER_TOKEN"
+TOKEN_DIR_ENV = "MCP_TOKEN_DIR"
 MIN_TOKEN_LENGTH = 32
 
 
@@ -82,18 +87,91 @@ def read_keychain(account):
         return None
 
 
-def load_secrets(project):
+def write_keychain(account, value):
+    import keyring
+    keyring.set_password(KEYCHAIN_SERVICE, account, value)
+
+
+def token_file(ref):
+    folder = os.environ.get(TOKEN_DIR_ENV)
+    return Path(folder) / (secret_env_name(ref) + ".json") if folder else None
+
+
+def read_secret(ref):
+    """(value, where) for a secret:// ref. A refreshed token in MCP_TOKEN_DIR wins, since
+    it's newer than whatever was pasted into the environment."""
+    file = token_file(ref)
+    value = os.environ.get(secret_env_name(ref))
+    if file and file.is_file():
+        saved = file.read_text(encoding="utf-8").strip()
+        # After a fresh sign-in, the new bundle pasted into the environment is newer than the file
+        if not value or issued_at(saved) >= issued_at(value):
+            return saved, "file"
+    if value:
+        return value, "env"
+    value = read_keychain(ref.removeprefix("secret://"))
+    return (value, "keychain") if value else (None, None)
+
+
+def issued_at(raw):
+    try:
+        return int(json.loads(raw).get("issued_at", 0))
+    except (ValueError, AttributeError, TypeError):
+        return 0
+
+
+def token_saver(api_id, ref, where):
+    """Where a refreshed token bundle goes: the token dir if set, else back to the keychain.
+    An environment variable can't be updated, so with neither, the new tokens live in memory."""
+    def save(bundle):
+        file = token_file(ref)
+        if file:
+            file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = file.with_suffix(".tmp")
+            tmp.write_text(dump_bundle(bundle), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, file)
+        elif where == "keychain":
+            write_keychain(ref.removeprefix("secret://"), dump_bundle(bundle))
+        else:
+            log(f"{api_id}: refreshed token kept in memory only. Set {TOKEN_DIR_ENV} to a writable "
+                "folder so it survives a restart.")
+    return save
+
+
+def load_secrets(project, project_path="<project.json>"):
     keys = {}
     for api in project["apis"]:
         if "auth" not in api:
             continue
         ref = api["auth"]["secretRef"]
-        env_name = secret_env_name(ref)
-        key = os.environ.get(env_name) or read_keychain(ref.removeprefix("secret://"))
-        if not key:
-            # Name the ref, never the value
-            raise SystemExit(f"Missing secret {ref}: store it in the OS keychain, or set {env_name}")
-        keys[api["id"]] = key
+        value, where = read_secret(ref)
+        cfg = oauth_config(api)
+        if not cfg:
+            if not value:
+                # Name the ref, never the value
+                raise SystemExit(f"Missing secret {ref}: store it in the OS keychain, or set {secret_env_name(ref)}")
+            keys[api["id"]] = value
+            continue
+
+        try:
+            check_config(api)
+        except OAuthError as e:
+            raise SystemExit(str(e))
+        if not value:
+            raise SystemExit(f"{api['id']} isn't signed in. Run: uv run upstream_oauth.py login "
+                             f"--project {project_path} --api {api['id']}  (on a host: set {secret_env_name(ref)})")
+        client_secret = None
+        if cfg.get("clientSecretRef"):
+            client_secret, _ = read_secret(cfg["clientSecretRef"])
+            if not client_secret:
+                raise SystemExit(f"Missing secret {cfg['clientSecretRef']} (the OAuth app's client secret): "
+                                 f"store it with upstream_oauth.py client-secret, or set "
+                                 f"{secret_env_name(cfg['clientSecretRef'])}")
+        keys[api["id"]] = TokenSource(api["id"], cfg, value, client_secret,
+                                      load_latest=lambda ref=ref: read_secret(ref)[0],
+                                      save=token_saver(api["id"], ref, where), log=log,
+                                      project_path=project_path)
     return keys
 
 
@@ -153,26 +231,37 @@ async def call_upstream(api, tool, arguments, key, byte_cap):
     if urlsplit(url).netloc != urlsplit(base).netloc:
         raise ValueError("Blocked: request left the API host")
 
-    # Auth goes in last, so a header argument can never replace it
     auth = api.get("auth")
-    if auth:
-        placement = auth["placement"]
-        value = placement.get("prefix", "") + key  # e.g. "Bearer " for bearer tokens
-        if placement["in"] == "header":
-            headers[placement["name"]] = value
-        else:
-            query[placement["name"]] = value
+    oauth = isinstance(key, TokenSource)
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.request(
-                tool["method"], url, params=query, headers=headers,
-                json=body if body is not None else None,
-            )
-    except httpx.RequestError as e:
-        # httpx errors can include the full URL, which holds the key when it's a
-        # query parameter. Report the error type only.
-        raise ValueError(f"Could not reach the API ({type(e).__name__})") from None
+    async def send(secret):
+        # Auth goes in last, so a header argument can never replace it
+        h, q = dict(headers), dict(query)
+        if auth:
+            placement = auth["placement"]
+            value = placement.get("prefix", "") + secret  # e.g. "Bearer " for bearer tokens
+            if placement["in"] == "header":
+                h = {k: v for k, v in h.items() if k.lower() != placement["name"].lower()}
+                h[placement["name"]] = value
+            else:
+                q[placement["name"]] = value
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                return await client.request(
+                    tool["method"], url, params=q, headers=h,
+                    json=body if body is not None else None,
+                )
+        except httpx.RequestError as e:
+            # httpx errors can include the full URL, which holds the key when it's a
+            # query parameter. Report the error type only.
+            raise ValueError(f"Could not reach the API ({type(e).__name__})") from None
+
+    secret = await key.access_token() if oauth else key
+    response = await send(secret)
+    if oauth and response.status_code == 401 and key.can_refresh:
+        # Revoked or expired early: refresh once and retry
+        await key.refresh(secret)
+        response = await send(key.bundle["access_token"])
 
     if response.status_code >= 400:
         raise ValueError(f"Upstream returned {response.status_code}: {truncate(response.text, 2_000)}")
@@ -343,6 +432,18 @@ def check_public_url(url):
         raise SystemExit("--public-url must be https:// (http only for 127.0.0.1 or localhost).")
     if parts.path not in ("", "/"):
         raise SystemExit("--public-url is the server's base URL, like https://my-server.example.com")
+    try:
+        parts.port  # raises on junk like "127.0.0.1:8000.trycloudflare.com"
+        valid = True
+    except ValueError:
+        valid = False
+    host = parts.hostname or ""
+    if not host or not valid:
+        raise SystemExit(f"--public-url {url!r} isn't a valid URL. Copy the https://....trycloudflare.com "
+                         "address cloudflared printed, or your host's URL.")
+    if parts.scheme == "https" and is_loopback(host):
+        raise SystemExit("--public-url is the public address (your tunnel or host), not 127.0.0.1. "
+                         "Use the https://....trycloudflare.com URL cloudflared printed.")
     return url
 
 
@@ -362,7 +463,7 @@ def main():
     opts = parser.parse_args()
 
     project = load_project(opts.project)
-    keys = load_secrets(project)  # fail at startup, not halfway through a chat
+    keys = load_secrets(project, opts.project)  # fail at startup, not halfway through a chat
     server, count = build_server(project, keys)
 
     if not opts.http:

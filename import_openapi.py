@@ -162,9 +162,32 @@ def detect_auth(spec, project_name, api_id, warnings):
         return None, chosen
     elif kind == "http" and str(scheme.get("scheme", "")).lower() == "bearer":
         placement = {"in": "header", "name": "Authorization", "prefix": "Bearer "}
+    elif kind == "oauth2" and (scheme.get("flows") or {}).get("authorizationCode"):
+        flow = scheme["flows"]["authorizationCode"]
+        placement = {"in": "header", "name": "Authorization", "prefix": "Bearer "}
+        # Scopes: the ones the spec's global security requirement asks for, else none (edit later)
+        wanted = next((list(r[chosen]) for r in spec.get("security") or [] if r.get(chosen)), [])
+        base = slug(project_name) + "/" + slug(api_id)
+        oauth2 = {
+            "authorizeUrl": flow.get("authorizationUrl", ""),
+            "tokenUrl": flow.get("tokenUrl", ""),
+            "clientId": "",
+            "clientSecretRef": f"secret://{base}/clientSecret",
+            "scopes": wanted,
+        }
+        warnings.append(f"Auth scheme '{chosen}' is OAuth. Register an OAuth app with the provider "
+                        "(redirect URL http://127.0.0.1/callback), fill in its client ID, store its "
+                        "client secret, then sign in.")
+        if not wanted and flow.get("scopes"):
+            warnings.append("No scopes were chosen. Available: " + ", ".join(list(flow["scopes"])[:15])
+                            + ". Add the ones you need to auth.oauth2.scopes.")
+        if len(schemes) > 1:
+            warnings.append(f"The spec defines {len(schemes)} auth schemes; using '{chosen}' for every tool.")
+        return {"secretRef": f"secret://{base}/oauth", "placement": placement, "oauth2": oauth2}, chosen
     elif kind in ("oauth2", "openIdConnect"):
-        warnings.append(f"Auth scheme '{chosen}' is OAuth, which arrives in milestone 6. "
-                        "Configured as a bearer token instead: store a token you got from the provider.")
+        warnings.append(f"Auth scheme '{chosen}' is OAuth without an authorization code flow, which "
+                        "isn't supported. Configured as a bearer token instead: store a token you got "
+                        "from the provider.")
         placement = {"in": "header", "name": "Authorization", "prefix": "Bearer "}
     else:
         warnings.append(f"Auth scheme '{chosen}' ({kind} {scheme.get('scheme', '')}) isn't supported yet. "
@@ -490,7 +513,13 @@ def main():
             print(f"({len(skipped)} operation(s) skipped)")
 
         print("\nNext:")
-        if auth:
+        if auth and auth.get("oauth2"):
+            print(f"  1. Register an OAuth app on {auth['oauth2']['authorizeUrl'].split('/')[2]} with redirect URL "
+                  "http://127.0.0.1/callback, and put its client ID in auth.oauth2.clientId")
+            print(f"  2. uv run upstream_oauth.py client-secret --project {out_path.name}")
+            print(f"  3. uv run upstream_oauth.py login --project {out_path.name}")
+            print("  4. Quit Claude Desktop, then install:")
+        elif auth:
             account = auth["secretRef"].removeprefix("secret://")
             print("  1. Store the secret (input is hidden):")
             print(f"     uv run python -c \"import keyring, getpass; keyring.set_password("

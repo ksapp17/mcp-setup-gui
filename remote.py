@@ -26,7 +26,8 @@ import sys
 from pathlib import Path
 
 from install import InstallError, read_json
-from runtime import BEARER_ENV, KEYCHAIN_SERVICE, MIN_TOKEN_LENGTH, read_keychain, secret_env_name
+from runtime import (BEARER_ENV, KEYCHAIN_SERVICE, MIN_TOKEN_LENGTH, TOKEN_DIR_ENV, check_public_url,
+                     read_keychain, secret_env_name)
 
 HERE = Path(__file__).resolve().parent
 RUNTIME = HERE / "runtime.py"
@@ -59,12 +60,25 @@ def host_env(project, with_values=False):
              "The server's token: sign-in secret, signing key, and header token"),
             ("MCP_PUBLIC_URL", public_base(project) if with_values else None,
              "Public base URL, like https://my-server.example.com. Turns on OAuth sign-in")]
+    oauth = False
     for api in project["apis"]:
         auth = api.get("auth")
-        if auth:
-            ref = auth["secretRef"]
-            value = read_keychain(ref.removeprefix("secret://")) if with_values else None
+        if not auth:
+            continue
+        ref = auth["secretRef"]
+        value = read_keychain(ref.removeprefix("secret://")) if with_values else None
+        if auth.get("oauth2"):
+            oauth = True
+            rows.append((secret_env_name(ref), value, f"Sign-in tokens for {api['id']} (JSON, from upstream_oauth.py login)"))
+            client_ref = auth["oauth2"].get("clientSecretRef")
+            if client_ref:
+                client_value = read_keychain(client_ref.removeprefix("secret://")) if with_values else None
+                rows.append((secret_env_name(client_ref), client_value, f"OAuth client secret for {api['id']}"))
+        else:
             rows.append((secret_env_name(ref), value, f"Upstream secret for {api['id']}"))
+    if oauth:
+        rows.append((TOKEN_DIR_ENV, "/data/tokens" if with_values else None,
+                     "Writable folder (a volume) so refreshed sign-in tokens survive restarts"))
     return rows
 
 
@@ -90,10 +104,13 @@ def validate_url(url):
 
 def docker_commands(project, project_file):
     image = f"mcp-{project['name']}"
-    env_flags = " ".join(f"-e {name}" for name, _, _ in host_env(project))
+    names = [name for name, _, _ in host_env(project)]
+    flags = " ".join(f"-e {name}" for name in names if name != TOKEN_DIR_ENV)
+    if TOKEN_DIR_ENV in names:  # a volume, so refreshed OAuth tokens survive restarts
+        flags += f" -v {image}-tokens:/data/tokens -e {TOKEN_DIR_ENV}=/data/tokens"
     return [
         f"docker build --build-arg PROJECT={project_file} -t {image} .",
-        f"docker run --rm -p 8000:8000 {env_flags} {image}",
+        f"docker run --rm -p 8000:8000 {flags} {image}",
     ]
 
 
@@ -184,6 +201,8 @@ def cmd_serve(opts):
     env = dict(os.environ)
     env[BEARER_ENV] = token
     public = opts.public_url or public_base(project)
+    if public:
+        public = check_public_url(public)  # fail here with a clear message, not a traceback
     args = [sys.executable, str(RUNTIME), "--project", str(path), "--http", "--host", "127.0.0.1",
             "--port", str(opts.port)]
     if public:

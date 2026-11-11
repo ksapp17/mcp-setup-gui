@@ -172,6 +172,20 @@ def check_project(project_path):
         ref = api["auth"]["secretRef"]
         if not ref.startswith("secret://"):
             raise InstallError(f"{api['id']}: secretRef must start with secret://")
+        if api["auth"].get("oauth2"):
+            from upstream_oauth import OAuthError, check_config
+            try:
+                cfg = check_config(api)
+            except OAuthError as e:
+                raise InstallError(str(e))
+            secret_ref = cfg.get("clientSecretRef")
+            if secret_ref and not keyring.get_password(KEYCHAIN_SERVICE, secret_ref.removeprefix("secret://")):
+                raise InstallError(f"{api['id']}: the OAuth app's client secret isn't stored yet. Run:\n"
+                                   f"  uv run upstream_oauth.py client-secret --project {project_path} --api {api['id']}")
+            if not keyring.get_password(KEYCHAIN_SERVICE, ref.removeprefix("secret://")):
+                raise InstallError(f"{api['id']} isn't signed in yet. Run:\n"
+                                   f"  uv run upstream_oauth.py login --project {project_path} --api {api['id']}")
+            continue
         if not keyring.get_password(KEYCHAIN_SERVICE, ref.removeprefix("secret://")):
             raise InstallError(
                 f"Secret {ref} isn't in the keychain yet. Store it with:\n"

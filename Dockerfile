@@ -5,6 +5,7 @@
 #
 # `uv run remote.py env --project project.json` lists the exact variables a project needs.
 # No secret is baked into the image: the token and API keys arrive as environment variables.
+# Projects with OAuth APIs also get: -v mcp-tokens:/data/tokens -e MCP_TOKEN_DIR=/data/tokens
 
 FROM python:3.13-slim
 
@@ -19,12 +20,13 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY runtime.py oauth.py ./
+COPY runtime.py oauth.py upstream_oauth.py ./
 ARG PROJECT=project.json
 COPY ${PROJECT} ./project.json
 
-# Don't run as root
-RUN useradd --create-home --uid 10001 mcp
+# Don't run as root. /data/tokens is where refreshed upstream OAuth tokens go
+# (MCP_TOKEN_DIR); mount a volume there so they survive restarts.
+RUN useradd --create-home --uid 10001 mcp && mkdir -p /data/tokens && chown mcp /data/tokens
 USER mcp
 
 # Most hosts set PORT; the runtime reads it

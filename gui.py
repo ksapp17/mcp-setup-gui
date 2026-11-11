@@ -42,6 +42,7 @@ import claude_code
 import import_openapi as importer
 import install as installer
 import remote
+import upstream_oauth as upstream
 
 HERE = Path(__file__).resolve().parent
 KEYCHAIN_SERVICE = "mcp-setup-gui"
@@ -400,7 +401,9 @@ async def save_draft(request):
 
     rel = draft["out"].relative_to(HERE).as_posix()
     msg = f"Wrote {len(tools)} tool(s) to {rel}."
-    if draft["auth"]:
+    if draft["auth"] and draft["auth"].get("oauth2"):
+        msg += " Fill in the OAuth app's client ID and secret below, then sign in."
+    elif draft["auth"]:
         msg += " Store the API's secret below, then install."
     return go("/project", file=rel, msg=msg)
 
@@ -418,7 +421,9 @@ async def show_project(request):
     tool_options = ""
     for a_i, api in enumerate(data["apis"]):
         stored = secret_stored(api)
-        if api.get("auth"):
+        if upstream.oauth_config(api):
+            secret_form, auth_line = oauth_card(rel, api)
+        elif api.get("auth"):
             p = api["auth"]["placement"]
             secret_tag = '<span class="tag ok">secret stored</span>' if stored else '<span class="tag bad">secret missing</span>'
             secret_form = f"""
@@ -662,6 +667,130 @@ async def store_secret(request):
     account = api["auth"]["secretRef"].removeprefix("secret://")
     keyring.set_password(KEYCHAIN_SERVICE, account, value)
     return go("/project", file=rel, msg=f"Secret for {api['id']} saved to the OS keychain.")
+
+
+# ---------------------------------------------------------- upstream oauth ---
+
+LOGINS = {}  # (project file, api id) -> {"status": waiting|done|error, "message", "url", "flow"}
+
+
+def oauth_card(rel, api):
+    """Auth line and forms for an API that uses OAuth: client ID/secret, sign in, sign out."""
+    cfg = upstream.oauth_config(api)
+    stored = upstream.stored_tokens(api)
+    login = LOGINS.get((rel, api["id"]))
+    host = e(remote_host(cfg.get("authorizeUrl", "")))
+    tag = ('<span class="tag ok">signed in</span>' if stored else '<span class="tag bad">not signed in</span>')
+    auth_line = f"Auth: OAuth 2.0 via <code>{host}</code> · {tag}"
+    if stored:
+        auth_line += f'<div class="muted">{e(upstream.describe(stored).removeprefix("signed in, "))}</div>'
+
+    hidden = f'<input type="hidden" name="file" value="{e(rel)}"><input type="hidden" name="api" value="{e(api["id"])}">'
+    secret_ref = cfg.get("clientSecretRef")
+    secret_saved = bool(secret_ref and keyring.get_password(KEYCHAIN_SERVICE, secret_ref.removeprefix("secret://")))
+    secret_field = ""
+    if secret_ref:
+        secret_field = f"""<div><label>Client secret <span class="muted">({"stored; type to replace" if secret_saved else "not stored"}, kept in the OS keychain)</span></label>
+  <input type="password" name="client_secret" autocomplete="off"></div>"""
+    forms = f"""
+<form method="post" action="/oauth/client" class="row">{hidden}
+  <div><label>Client ID <span class="muted">(from the OAuth app you registered with the provider)</span></label>
+  <input type="text" name="client_id" value="{e(cfg.get("clientId", ""))}" autocomplete="off"></div>{secret_field}
+  <div><button class="secondary">Save</button></div>
+</form>
+<p class="muted">Register the app with redirect URL <code>http://127.0.0.1{e(str(":" + str(cfg["redirectPort"])) if cfg.get("redirectPort") else "")}{e(cfg.get("redirectPath", upstream.DEFAULT_REDIRECT_PATH))}</code>.</p>
+<form method="post" action="/oauth/start" class="row">{hidden}
+  <div><button>{"Sign in again" if stored else "Sign in"}</button></div>
+</form>"""
+    if stored:
+        forms += f"""<form method="post" action="/oauth/logout" class="row">{hidden}
+  <div><button class="secondary">Sign out</button></div></form>"""
+    if login and login["status"] == "waiting":
+        forms += (f'<div class="msg info">Waiting for the sign-in in your browser. If no tab opened, '
+                  f'<a href="{e(login["url"])}" target="_blank" rel="noreferrer">open the sign-in page</a>. '
+                  f'Then refresh this page.</div>')
+    elif login and login["status"] == "error":
+        forms += f'<div class="msg error">Last sign-in failed: {e(login["message"])}</div>'
+    return forms, auth_line
+
+
+def remote_host(url):
+    from urllib.parse import urlsplit
+    return urlsplit(url).hostname or "?"
+
+
+def find_oauth_api(data, api_id):
+    api = next((a for a in data["apis"] if a.get("id") == api_id), None)
+    if not api or not upstream.oauth_config(api):
+        raise UserError("That API doesn't use OAuth.")
+    return api
+
+
+@handled
+async def oauth_client(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    path, data = open_project(rel)
+    api = find_oauth_api(data, form.get("api"))
+    cfg = api["auth"]["oauth2"]
+    client_id = form.get("client_id", "").strip()
+    if client_id != cfg.get("clientId", ""):
+        cfg["clientId"] = client_id
+        installer.atomic_write(path, installer.to_text(data))
+    secret = form.get("client_secret", "").strip()
+    if secret:
+        if not cfg.get("clientSecretRef"):
+            raise UserError("This API has no oauth2.clientSecretRef in project.json, so there's nowhere to keep a client secret.")
+        keyring.set_password(KEYCHAIN_SERVICE, cfg["clientSecretRef"].removeprefix("secret://"), secret)
+    return go("/project", file=rel, msg=f"OAuth app settings for {api['id']} saved.")
+
+
+@handled
+async def oauth_start(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    _, data = open_project(rel)
+    api = find_oauth_api(data, form.get("api"))
+    key = (rel, api["id"])
+    old = LOGINS.get(key)
+    if old and old["status"] == "waiting":
+        old["flow"].cancel()  # its listener stops on its next tick, freeing a fixed redirect port
+        await run_in_threadpool(old["thread"].join, 3)
+    try:
+        upstream.check_config(api)
+        flow = upstream.LoginFlow(api, upstream.client_secret_for(api, rel),
+                                  return_url=f"http://127.0.0.1:{PORT}/project?{urlencode({'file': rel})}")
+        url = flow.start()
+    except upstream.OAuthError as err:
+        raise UserError(str(err))
+    entry = {"status": "waiting", "message": "", "url": url, "flow": flow}
+    LOGINS[key] = entry
+
+    def finish():
+        try:
+            upstream.save_tokens(api, flow.wait())
+            entry.update(status="done", message="")
+        except Exception as err:  # OAuthError, keychain errors
+            entry.update(status="error", message=str(err))
+
+    entry["thread"] = threading.Thread(target=finish, daemon=True)
+    entry["thread"].start()
+    webbrowser.open(url)
+    return go("/project", file=rel, msg=f"Sign-in for {api['id']} opened in a new tab. Approve it there, then refresh this page.")
+
+
+@handled
+async def oauth_logout(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    _, data = open_project(rel)
+    api = find_oauth_api(data, form.get("api"))
+    try:
+        keyring.delete_password(KEYCHAIN_SERVICE, api["auth"]["secretRef"].removeprefix("secret://"))
+    except Exception:
+        pass
+    LOGINS.pop((rel, api["id"]), None)
+    return go("/project", file=rel, msg=f"Signed out of {api['id']}. To revoke access too, remove the app on the provider's site.")
 
 
 # -------------------------------------------------------------------- test ---
@@ -1055,6 +1184,9 @@ app = Starlette(
         Route("/project", show_project),
         Route("/project/save", save_project, methods=["POST"]),
         Route("/secret", store_secret, methods=["POST"]),
+        Route("/oauth/client", oauth_client, methods=["POST"]),
+        Route("/oauth/start", oauth_start, methods=["POST"]),
+        Route("/oauth/logout", oauth_logout, methods=["POST"]),
         Route("/test", test_tool, methods=["POST"]),
         Route("/install/preview", preview_change, methods=["POST"]),
         Route("/install/apply", apply_change, methods=["POST"]),

@@ -1,0 +1,49 @@
+{
+  "name": "github",
+  "responseByteCap": 50000,
+  "apis": [
+    {
+      "id": "github",
+      "baseUrl": "https://api.github.com",
+      "auth": {
+        "secretRef": "secret://github/github/oauth",
+        "placement": { "in": "header", "name": "Authorization", "prefix": "Bearer " },
+        "oauth2": {
+          "authorizeUrl": "https://github.com/login/oauth/authorize",
+          "tokenUrl": "https://github.com/login/oauth/access_token",
+          "clientId": "Ov23liqlvxRvStqfz2LS",
+          "clientSecretRef": "secret://github/github/clientSecret",
+          "scopes": ["read:user"]
+        }
+      },
+      "tools": [
+        {
+          "name": "github_get_me",
+          "description": "The signed-in GitHub user's profile: login, name, bio, public repo and follower counts. Use when the user asks about their own GitHub account.",
+          "method": "GET",
+          "path": "/user",
+          "paramLocations": {},
+          "inputSchema": { "type": "object", "properties": {} },
+          "annotations": { "readOnlyHint": true }
+        },
+        {
+          "name": "github_my_repos",
+          "description": "Repositories the signed-in GitHub user owns, most recently pushed first. Use when the user asks what repos they have or what they've worked on lately.",
+          "method": "GET",
+          "path": "/user/repos",
+          "paramLocations": { "per_page": "query", "sort": "query", "affiliation": "query" },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "per_page": { "type": "integer", "description": "How many to return, 1-100. Use 10 unless asked." },
+              "sort": { "type": "string", "enum": ["pushed", "updated", "created", "full_name"], "description": "Use pushed unless asked." },
+              "affiliation": { "type": "string", "enum": ["owner"], "description": "Always owner." }
+            },
+            "required": ["per_page", "sort", "affiliation"]
+          },
+          "annotations": { "readOnlyHint": true }
+        }
+      ]
+    }
+  ]
+}
