@@ -1,0 +1,8 @@
+.venv
+.git
+__pycache__
+*.pyc
+*.tmp
+*.mcpgui-tmp
+src
+README.md

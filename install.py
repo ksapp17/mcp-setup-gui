@@ -7,6 +7,8 @@ Usage (from the project folder):
 
     uv run install.py add    --project project.json --client claude-code [--scope user|local|project] [--folder DIR]
     uv run install.py remove --project project.json --client claude-code
+    uv run install.py add    --project project.json --client claude-code --url https://host/mcp   (remote server)
+    uv run install.py remove --project project.json --client claude-code --remote
 
 Options:
     --client NAME   claude-desktop (default) or claude-code
@@ -381,6 +383,8 @@ def cmd_remove(opts):
 def cmd_add_code(opts):
     import claude_code
 
+    if opts.url:
+        return cmd_add_code_remote(opts)
     project_path = Path(opts.project).resolve()
     project = check_project(project_path)
     name = project["name"]
@@ -415,16 +419,60 @@ def cmd_add_code(opts):
           + (" Claude Code will ask you to approve project-scope servers." if scope == "project" else ""))
 
 
+def cmd_add_code_remote(opts):
+    import claude_code
+    import remote
+
+    project_path = Path(opts.project).resolve()
+    project = read_json(project_path)
+    url = remote.validate_url(opts.url)
+    token = remote.get_token(project)
+    if not token:
+        raise InstallError("No inbound token yet. Run: uv run remote.py token --project " + opts.project)
+    name = claude_code.remote_name(project["name"])
+
+    if not opts.skip_verify:
+        print(f"Connecting to {url} ...")
+        tools, _ = remote.remote_session(url, token)
+        print(f"Remote server OK. Claude will get {len(tools)} tool(s):")
+        for t in tools:
+            print(f"  - {t.name}")
+
+    scope = opts.scope or "user"
+    cwd = claude_code.check_target(scope, opts.folder)
+    if scope == "project":
+        print("Warning: project scope would put your bearer token in .mcp.json, which is meant to be "
+              "committed. Use user or local scope for remote servers.")
+        if not confirm("Continue anyway?", opts.yes):
+            raise InstallError("Cancelled. Nothing was changed.")
+    print("Will run:\n  " + claude_code.display(claude_code.add_http_args(name, url, token, scope)))
+    if not confirm("\nRun it?", opts.yes):
+        raise InstallError("Cancelled. Nothing was changed.")
+
+    print(claude_code.add(name, project_path, scope, opts.folder, url=url, token=token))
+    project["deployment"] = {**project.get("deployment", {}), "mode": "remote", "url": url}
+    record_registration(project_path, project, {
+        "client": claude_code.CLIENT_ID,
+        "configPath": claude_code.registration_key(scope, opts.folder, remote=True),
+        "scope": scope, "folder": None if scope == "user" else str(cwd), "remote": True,
+        "serverName": name, "url": url, "status": "registered",
+        "registeredAt": datetime.now().isoformat(timespec="seconds"),
+    })
+    print(f"\nDone. '{name}' points at {url}. Start a new Claude Code session and run /mcp to see it.")
+
+
 def cmd_remove_code(opts):
     import claude_code
 
     project_path = Path(opts.project).resolve()
     project = read_json(project_path)
-    name = project["name"]
+    remote_entry = bool(opts.remote)
+    name = claude_code.remote_name(project["name"]) if remote_entry else project["name"]
 
     scope, folder = opts.scope, opts.folder
     if not scope:  # fall back to what was recorded at install time
-        recorded = [c for c in project.get("clients", []) if c.get("client") == claude_code.CLIENT_ID]
+        recorded = [c for c in project.get("clients", []) if c.get("client") == claude_code.CLIENT_ID
+                    and bool(c.get("remote")) == remote_entry]
         if len(recorded) != 1:
             raise InstallError("Pass --scope (and --folder for local or project scope): "
                                + ("no Claude Code registration is recorded."
@@ -437,7 +485,7 @@ def cmd_remove_code(opts):
     print(claude_code.remove(name, scope, folder))
     record_registration(project_path, project, {
         "client": claude_code.CLIENT_ID,
-        "configPath": claude_code.registration_key(scope, folder),
+        "configPath": claude_code.registration_key(scope, folder, remote=remote_entry),
         "status": "removed",
     })
 
@@ -473,6 +521,10 @@ def main():
         p.add_argument("--scope", choices=["user", "local", "project"],
                        help="Claude Code: where to register (default: user)")
         p.add_argument("--folder", help="Claude Code: project folder for local or project scope")
+        if cmd == "add":
+            p.add_argument("--url", help="Claude Code: register a remote server at this URL (ends in /mcp)")
+        else:
+            p.add_argument("--remote", action="store_true", help="Claude Code: remove the remote registration")
         p.add_argument("--yes", action="store_true", help="Don't ask for confirmation")
         if cmd == "add":
             p.add_argument("--skip-verify", action="store_true", help="Don't test-start the runtime")

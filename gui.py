@@ -41,6 +41,7 @@ from starlette.routing import Route
 import claude_code
 import import_openapi as importer
 import install as installer
+import remote
 
 HERE = Path(__file__).resolve().parent
 KEYCHAIN_SERVICE = "mcp-setup-gui"
@@ -99,6 +100,7 @@ async def guard(request: Request, call_next):
         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
         "base-uri 'none'; frame-ancestors 'none'")
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"  # pages can show tokens; keep them out of the browser cache
     response.headers["Referrer-Policy"] = "same-origin"  # "no-referrer" makes Chrome send Origin: null on form posts
     return response
 
@@ -495,12 +497,109 @@ async def show_project(request):
 </form>
 
 <h2>Claude Code</h2>
-{code_card(rel, data)}"""
+{code_card(rel, data)}
+
+<h2>Remote server</h2>
+<p class="sub">For claude.ai on the web, the Claude mobile apps, and connectors in Claude Desktop.
+They connect from Anthropic's servers, so the runtime has to run somewhere public over HTTPS.</p>
+{remote_card(rel, data)}"""
     return page(data["name"], body, request)
 
 
+def remote_card(rel, data):
+    token_ok = remote.get_token(data) is not None
+    url = (data.get("deployment") or {}).get("url") or ""
+    hidden = f'<input type="hidden" name="file" value="{e(rel)}">'
+
+    if token_ok:
+        token_html = f"""<span class="tag ok">token stored in keychain</span>
+<form method="post" action="/remote/token">{hidden}
+  <button class="secondary" name="action" value="show">Show token</button>
+  <button class="secondary" name="action" value="replace">Replace token</button>
+</form>"""
+    else:
+        token_html = f"""<span class="tag bad">no token yet</span>
+<form method="post" action="/remote/token">{hidden}<button name="action" value="create">Create token</button></form>"""
+
+    env_rows = "".join(f"<tr><td><code>{e(n)}</code></td><td>{e(w)}</td></tr>" for n, _, w in remote.host_env(data))
+    docker = "\n".join(remote.docker_commands(data, rel))
+    local_try = (f"uv run remote.py serve --project {rel}\n"
+                 "cloudflared tunnel --url http://127.0.0.1:8000")
+
+    tool_options = "".join(f'<option value="{e(t["name"])}">{e(t["name"])}</option>'
+                           for a in data["apis"] for t in a.get("tools", []) if t.get("enabled", True))
+    remote_recorded = [c for c in data.get("clients", [])
+                       if c.get("client") == claude_code.CLIENT_ID and c.get("remote")]
+    code_status = "".join(
+        f'<span class="tag ok">{e(c["scope"])} scope' + (f': {e(c["folder"])}' if c.get("folder") else "")
+        + "</span>" for c in remote_recorded) or '<span class="tag">Not registered</span>'
+
+    connect = ""
+    if url:
+        code_form = ""
+        if shutil.which("claude"):
+            code_form = f"""
+<form class="card" method="post" action="/code/preview">{hidden}<input type="hidden" name="remote" value="1">
+  <b>Claude Code</b> <div>{code_status}</div>
+  <div class="row">
+    <div><label>Scope</label><select name="scope">
+      <option value="user">user: every project on this machine</option>
+      <option value="local">local: one folder, only you</option></select></div>
+    <div><label>Project folder <span class="muted">(local scope only)</span></label><input type="text" name="folder"></div>
+  </div>
+  <p class="muted">Registers <code>{e(claude_code.remote_name(data["name"]))}</code> pointing at your URL, with the token as a header.</p>
+  <button name="action" value="add">Preview install</button>
+  <button class="secondary" name="action" value="remove">Preview removal</button>
+</form>"""
+        local_note = ""
+        if remote.is_local_url(url):
+            local_note = ('<div class="msg error">claude.ai connects from Anthropic\'s servers, so it can\'t reach '
+                          f'<code>{e(url)}</code>. Use the tunnel or your host\'s https URL for it. '
+                          'Claude Code on this PC can use the local URL.</div>')
+        connect = f"""
+<div class="card"><b>4. Test it</b>
+<form method="post" action="/remote/test">{hidden}
+  <div class="row"><div><label>Tool</label><select name="tool">{tool_options}</select></div>
+  <div><label>Arguments (JSON)</label><input type="text" name="args" value="{{}}"></div></div>
+  <button>Call the remote server</button>
+</form></div>
+<div class="card"><b>5. Connect Claude</b>
+{local_note}
+<p><b>claude.ai, Claude mobile and Claude Desktop:</b> in claude.ai open Settings, Connectors, Add custom connector.
+Enter the URL <code>{e(url)}</code>. Under Authentication choose <b>No sign-in</b>. Under Request headers add
+<code>x-api-key</code> with your token as the value (use Show token above), or <code>Authorization</code> with
+<code>Bearer &lt;your token&gt;</code> if that name is selectable. Connectors you add there also appear in the mobile apps
+and in Claude Desktop. Request headers are a beta and may not show in every account yet; OAuth (milestone 6) is the
+alternative.</p>
+</div>
+{code_form}"""
+
+    return f"""
+<div class="card"><b>1. Token</b> <span class="muted">Clients must send it; the server rejects everything else.</span>
+<div>{token_html}</div></div>
+
+<div class="card"><b>2. Run it somewhere public</b>
+<p class="muted">The server needs these environment variables. <code>uv run remote.py env --project {e(rel)} --values</code>
+prints their values for pasting into a host's secret settings.</p>
+<table><tr><th>Variable</th><th>What it is</th></tr>{env_rows}</table>
+<p><b>Any host that runs containers</b> (Render, Railway, Fly.io, a VPS) using the Dockerfile in this folder:</p>
+<pre>{e(docker)}</pre>
+<p><b>Or try it from this PC first</b> with a free Cloudflare quick tunnel, which gives you a temporary
+https URL. Run each in its own terminal; the tunnel prints the URL. Stop both when you're done.</p>
+<pre>{e(local_try)}</pre></div>
+
+<div class="card"><b>3. Server URL</b>
+<form method="post" action="/remote/url">{hidden}
+  <label>Public URL, ending in /mcp</label>
+  <input type="text" name="url" value="{e(url)}" placeholder="https://my-server.example.com/mcp">
+  <button class="secondary">Save URL</button>
+</form></div>
+{connect}"""
+
+
 def code_card(rel, data):
-    recorded = [c for c in data.get("clients", []) if c.get("client") == claude_code.CLIENT_ID]
+    recorded = [c for c in data.get("clients", [])
+                if c.get("client") == claude_code.CLIENT_ID and not c.get("remote")]
     status = "".join(
         f'<span class="tag ok">{e(c["scope"])} scope'
         + (f': {e(c["folder"])}' if c.get("folder") else ": all projects") + "</span>"
@@ -595,15 +694,23 @@ async def test_tool(request):
     rel = form.get("file", "")
     path, data = open_project(rel)
     tool = form.get("tool", "")
+    arguments = parse_arguments(form)
+
+    result, error, stderr = await run_in_threadpool(run_tool, path, tool, arguments)
+    return result_page(request, rel, data, tool, arguments, result, error, stderr)
+
+
+def parse_arguments(form):
     try:
         arguments = json.loads(form.get("args", "") or "{}")
     except json.JSONDecodeError as err:
         raise UserError(f"Arguments aren't valid JSON: {err}")
     if not isinstance(arguments, dict):
         raise UserError('Arguments must be a JSON object, like {"q": "Boise,US"}.')
+    return arguments
 
-    result, error, stderr = await run_in_threadpool(run_tool, path, tool, arguments)
 
+def result_page(request, rel, data, tool, arguments, result, error, stderr, where="local runtime"):
     if result is None:
         status = '<span class="tag bad">runtime failed</span>'
         output = f"The runtime didn't answer ({type(error).__name__}). Its error output is below."
@@ -618,7 +725,7 @@ async def test_tool(request):
         raw = json.dumps(result.model_dump(by_alias=True, exclude_none=True), indent=2, ensure_ascii=False)
 
     body = f"""
-<h1>{e(tool)}</h1><p class="sub">{e(data["name"])} · {status} · <a href="/project?{urlencode({"file": rel})}">Back to project</a></p>
+<h1>{e(tool)}</h1><p class="sub">{e(data["name"])} · {e(where)} · {status} · <a href="/project?{urlencode({"file": rel})}">Back to project</a></p>
 <h2>Arguments</h2><pre>{e(json.dumps(arguments, indent=2, ensure_ascii=False))}</pre>
 <h2>Response</h2><pre>{e(output)}</pre>
 {f'<h2>Raw MCP result</h2><pre>{e(raw)}</pre>' if raw else ''}
@@ -745,27 +852,48 @@ def code_target(form):
     return scope, (None if scope == "user" else str(cwd)), cwd
 
 
+def remote_target(data):
+    url = (data.get("deployment") or {}).get("url")
+    if not url:
+        raise UserError("Save the server URL first.")
+    token = remote.get_token(data)
+    if not token:
+        raise UserError("Create a token first.")
+    return url, token
+
+
 @handled
 async def code_preview(request):
     form = await request.form()
     action = "remove" if form.get("action") == "remove" else "add"
+    is_remote = form.get("remote") == "1"
     rel = form.get("file", "")
     path, data = open_project(rel)
-    name = data["name"]
     scope, folder, cwd = code_target(form)
+    name = claude_code.remote_name(data["name"]) if is_remote else data["name"]
 
     tools_html = ""
     if action == "add":
-        await run_in_threadpool(installer.check_project, path)
-        tools = await run_in_threadpool(installer.verify_runtime, path)
+        if is_remote:
+            url, token = remote_target(data)
+            tools, _ = await run_in_threadpool(remote.remote_session, url, token)
+            heading = f"Remote server answered. Claude will get {len(tools)} tool(s):"
+        else:
+            await run_in_threadpool(installer.check_project, path)
+            tools = await run_in_threadpool(installer.verify_runtime, path)
+            heading = f"Runtime started. Claude will get {len(tools)} tool(s):"
         items = "".join(f"<li><b>{e(t.name)}</b>: {e(t.description or '')}</li>" for t in tools)
-        tools_html = f'<div class="card"><b>Runtime started. Claude will get {len(tools)} tool(s):</b><ul>{items}</ul></div>'
+        tools_html = f'<div class="card"><b>{heading}</b><ul>{items}</ul></div>'
 
     existing = await run_in_threadpool(claude_code.get, name, cwd)
-    notes = [f'<div class="msg error">{e(w)}</div>' for w in claude_code.warnings_for(scope)] if action == "add" else []
+    notes = []
+    if action == "add" and not is_remote:
+        notes = [f'<div class="msg error">{e(w)}</div>' for w in claude_code.warnings_for(scope)]
+    if action == "add" and is_remote:
+        notes.append('<div class="msg info">Claude Code keeps the token in its own config file, in plain text.</div>')
     replace_box = ""
     if existing:
-        mine = claude_code.is_ours(existing)
+        mine = (data.get("deployment", {}).get("url", "") in existing) if is_remote else claude_code.is_ours(existing)
         notes.append(f'<div class="card"><b>Claude Code already has a server named {e(name)}'
                      f'{"" if mine else ", not created by this tool"}:</b><pre>{e(existing)}</pre></div>')
         if action == "add" and not mine:
@@ -775,13 +903,17 @@ async def code_preview(request):
         notes.append(f'<div class="msg error">Claude Code has no server named {e(name)} here. '
                      "Nothing to remove.</div>")
 
-    args = (claude_code.add_args(name, path, scope) if action == "add"
-            else claude_code.remove_args(name, scope))
+    if action == "add":
+        args = (claude_code.add_http_args(name, *remote_target(data), scope) if is_remote
+                else claude_code.add_args(name, path, scope))
+    else:
+        args = claude_code.remove_args(name, scope)
     can_run = action == "add" or existing
     confirm = f"""
 <form method="post" action="/code/apply">
   <input type="hidden" name="file" value="{e(rel)}"><input type="hidden" name="action" value="{action}">
   <input type="hidden" name="scope" value="{e(scope)}"><input type="hidden" name="folder" value="{e(folder or "")}">
+  <input type="hidden" name="remote" value="{"1" if is_remote else ""}">
   {replace_box}
   <button class="{"danger" if action == "remove" else ""}">{"Install" if action == "add" else "Remove"}: run this command</button>
 </form>""" if can_run else ""
@@ -800,29 +932,105 @@ async def code_preview(request):
 async def code_apply(request):
     form = await request.form()
     action = "remove" if form.get("action") == "remove" else "add"
+    is_remote = form.get("remote") == "1"
     rel = form.get("file", "")
     path, data = open_project(rel)
-    name = data["name"]
     scope, folder, cwd = code_target(form)
+    name = claude_code.remote_name(data["name"]) if is_remote else data["name"]
+    key = claude_code.registration_key(scope, folder, remote=is_remote)
 
     if action == "add":
-        await run_in_threadpool(installer.check_project, path)
-        output = await run_in_threadpool(claude_code.add, name, path, scope, folder, form.get("replace") == "1")
-        record = {"client": claude_code.CLIENT_ID, "configPath": claude_code.registration_key(scope, folder),
-                  "scope": scope, "folder": folder, "serverName": name, "status": "registered",
+        if is_remote:
+            url, token = remote_target(data)
+            output = await run_in_threadpool(claude_code.add, name, path, scope, folder,
+                                             form.get("replace") == "1", url, token)
+        else:
+            await run_in_threadpool(installer.check_project, path)
+            output = await run_in_threadpool(claude_code.add, name, path, scope, folder, form.get("replace") == "1")
+        record = {"client": claude_code.CLIENT_ID, "configPath": key, "scope": scope, "folder": folder,
+                  "serverName": name, "status": "registered",
                   "registeredAt": datetime.now().isoformat(timespec="seconds")}
+        if is_remote:
+            record.update(remote=True, url=data["deployment"]["url"])
         msg = "Registered with Claude Code. Start a new session and run /mcp to check it."
         if scope == "project":
             msg += " Claude Code will ask you to approve it."
     else:
         output = await run_in_threadpool(claude_code.remove, name, scope, folder)
-        record = {"client": claude_code.CLIENT_ID, "configPath": claude_code.registration_key(scope, folder),
-                  "status": "removed"}
+        record = {"client": claude_code.CLIENT_ID, "configPath": key, "status": "removed"}
         msg = "Removed from Claude Code."
     _, fresh = open_project(rel)
     installer.record_registration(path, fresh, record)
     last_line = output.strip().splitlines()[0] if output.strip() else ""
     return go("/project", file=rel, msg=f"{msg} ({last_line})" if last_line else msg)
+
+
+# ------------------------------------------------------------------ remote ---
+
+@handled
+async def remote_token(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    _, data = open_project(rel)
+    action = form.get("action")
+    existing = remote.get_token(data)
+
+    if action == "show":
+        if not existing:
+            raise UserError("There's no token yet.")
+        token, heading = existing, "Your token"
+        note = "This is the token already in use."
+    elif action == "create" and existing:
+        raise UserError("A token already exists. Use Show token, or Replace token.")
+    elif action in ("create", "replace"):
+        token = await run_in_threadpool(remote.create_token, data)
+        heading = "New token"
+        note = ("Stored in your OS keychain." + (" The old token stops working once you update the host "
+                "and every client." if action == "replace" else ""))
+    else:
+        raise UserError("Unknown action.")
+
+    body = f"""
+<h1>{heading}</h1><p class="sub">{e(data["name"])} · <a href="/project?{urlencode({"file": rel})}">Back to project</a></p>
+<pre>{e(token)}</pre>
+<p>{e(note)}</p>
+<ul>
+  <li>On the host: set <code>{e(remote.BEARER_ENV)}</code> to this value.</li>
+  <li>In claude.ai's Add custom connector: Authentication <b>No sign-in</b>, then Request headers <code>x-api-key</code> = this value.</li>
+  <li>For Claude Code and other clients: header <code>Authorization</code> = <code>Bearer</code> followed by this value.</li>
+</ul>
+<p class="muted">Anyone with this token can call your tools, and spend your API quota. Don't paste it into chats,
+screenshots or git.</p>"""
+    return page(heading, body, request)
+
+
+@handled
+async def remote_url(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    path, data = open_project(rel)
+    url = remote.validate_url(form.get("url", ""))
+    data["deployment"] = {**(data.get("deployment") or {}), "mode": "remote", "url": url}
+    installer.atomic_write(path, installer.to_text(data))
+    return go("/project", file=rel, msg="Server URL saved. Test it below.")
+
+
+@handled
+async def remote_test(request):
+    form = await request.form()
+    rel = form.get("file", "")
+    _, data = open_project(rel)
+    url, token = remote_target(data)
+    tool = form.get("tool", "")
+    arguments = parse_arguments(form)
+    try:
+        _, result = await run_in_threadpool(remote.remote_session, url, token, tool, arguments)
+        error = None
+    except installer.InstallError as err:
+        result, error = None, err
+    if result is None:
+        raise UserError(str(error))
+    return result_page(request, rel, data, tool, arguments, result, None, "", where=url)
 
 
 # --------------------------------------------------------------------- app ---
@@ -846,6 +1054,9 @@ app = Starlette(
         Route("/install/apply", apply_change, methods=["POST"]),
         Route("/code/preview", code_preview, methods=["POST"]),
         Route("/code/apply", code_apply, methods=["POST"]),
+        Route("/remote/token", remote_token, methods=["POST"]),
+        Route("/remote/url", remote_url, methods=["POST"]),
+        Route("/remote/test", remote_test, methods=["POST"]),
     ],
     middleware=[Middleware(BaseHTTPMiddleware, dispatch=guard)],
 )

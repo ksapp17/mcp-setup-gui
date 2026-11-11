@@ -65,6 +65,21 @@ def add_args(name, project_path, scope):
             sys.executable, str(RUNTIME), "--project", str(project_path)]
 
 
+def add_http_args(name, url, token, scope):
+    # Remote server: Claude Code connects to the URL and sends the bearer token on every request.
+    # Claude Code keeps this header in its own config file, in plain text.
+    return ["mcp", "add", "--transport", "http", "--scope", scope, name, url,
+            "--header", f"Authorization: Bearer {token}"]
+
+
+TOKEN_PATTERN = re.compile(r"(Bearer\s+)[A-Za-z0-9_\-.~+/=]+")
+
+
+def mask(text):
+    """Hide bearer tokens in anything shown to the user."""
+    return TOKEN_PATTERN.sub(r"\1••••••••", text)
+
+
 def remove_args(name, scope):
     return ["mcp", "remove", "--scope", scope, name]
 
@@ -72,7 +87,7 @@ def remove_args(name, scope):
 def display(args):
     """The command as the user would type it, for previews."""
     parts = ["claude", *args]
-    return subprocess.list2cmdline(parts) if os.name == "nt" else shlex.join(parts)
+    return mask(subprocess.list2cmdline(parts) if os.name == "nt" else shlex.join(parts))
 
 
 def is_ours(get_output):
@@ -82,7 +97,7 @@ def is_ours(get_output):
 def get(name, cwd):
     """`claude mcp get` output for a server, or None if it doesn't exist."""
     code, output = run(["mcp", "get", name], cwd)
-    return output if code == 0 else None
+    return mask(output) if code == 0 else None
 
 
 def warnings_for(scope):
@@ -93,28 +108,31 @@ def warnings_for(scope):
     return []
 
 
-def add(name, project_path, scope, folder, replace_foreign=False):
-    """Register the project. Replaces an earlier registration made by this tool in the same scope."""
+def add(name, project_path, scope, folder, replace_foreign=False, url=None, token=None):
+    """Register the project: locally (stdio) by default, or as a remote server when url is given.
+    Replaces an earlier registration made by this tool in the same scope."""
     cwd = check_target(scope, folder)
-    code, output = run(add_args(name, project_path, scope), cwd)
+    args = add_http_args(name, url, token, scope) if url else add_args(name, project_path, scope)
+    code, output = run(args, cwd)
     if code == 0:
-        return output
+        return mask(output)
 
     if "already exists" not in output:
-        raise InstallError(f"claude mcp add failed:\n{output}")
+        raise InstallError(f"claude mcp add failed:\n{mask(output)}")
 
     # Same name in the same scope: replace it only if it's ours, or the user said so
     existing = get(name, cwd) or ""
-    if not is_ours(existing) and not replace_foreign:
+    ours = (url in existing) if url else is_ours(existing)
+    if not ours and not replace_foreign:
         raise InstallError(f"Claude Code already has a server named '{name}' in {scope} scope that this "
                            f"tool didn't create:\n{existing}\nRemove it first, or rename the project.")
     code, removed = run(remove_args(name, scope), cwd)
     if code != 0:
         raise InstallError(f"Couldn't replace the existing '{name}':\n{removed}")
-    code, output = run(add_args(name, project_path, scope), cwd)
+    code, output = run(args, cwd)
     if code != 0:
-        raise InstallError(f"claude mcp add failed after removing the old entry:\n{output}")
-    return f"Replaced the earlier '{name}'.\n{output}"
+        raise InstallError(f"claude mcp add failed after removing the old entry:\n{mask(output)}")
+    return f"Replaced the earlier '{name}'.\n{mask(output)}"
 
 
 def remove(name, scope, folder):
@@ -125,7 +143,12 @@ def remove(name, scope, folder):
     return output
 
 
-def registration_key(scope, folder):
+def registration_key(scope, folder, remote=False):
     """Where a registration lives, used to match records in project.json."""
     target = "~" if scope == "user" else str(check_target(scope, folder))
-    return f"claude-code:{scope}:{target}"
+    return f"claude-code{'-remote' if remote else ''}:{scope}:{target}"
+
+
+def remote_name(project_name):
+    # A different name from the local registration, so both can exist side by side
+    return f"{project_name}-remote"

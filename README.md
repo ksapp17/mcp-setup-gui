@@ -4,7 +4,7 @@ Turn an HTTP API into tools Claude can use, without writing server code or hand-
 
 You describe an API in `project.json`. A generic MCP runtime serves every endpoint you list as a tool, and an installer registers it with Claude Desktop safely: it verifies the server first, shows a diff, backs up the config, and can undo the change.
 
-**Status:** milestones 1 to 4 of 7 work, with a browser UI: local stdio servers for Claude Desktop and Claude Code, API-key and bearer auth, import from OpenAPI specs, and a built-in tool tester. Remote deployment, OAuth and more clients are planned (see [Roadmap](#roadmap)).
+**Status:** milestones 1 to 5 of 7 work, with a browser UI: local servers for Claude Desktop and Claude Code, remote servers for claude.ai and mobile, API-key and bearer auth, import from OpenAPI specs, and a built-in tool tester. OAuth and more clients are planned (see [Roadmap](#roadmap)).
 
 ```
 project.json ──► runtime.py ──stdio──► Claude Desktop ──► Claude
@@ -33,6 +33,7 @@ It opens a page in your browser where you can:
 - **Test a tool**: run it the way Claude Desktop does and see the response, the raw MCP result and the runtime's log
 - **Install or remove** the project in Claude Desktop, after a preview of the exact change to the config file
 - **Register it with Claude Code** in user, local or project scope, after a preview of the exact command
+- **Run it as a remote server** for claude.ai and the mobile apps: create the token, see what the host needs, test the deployed server, and register it
 
 The UI is plain HTML forms served by Python. It listens on `127.0.0.1` only, and the terminal prints a one-time link that signs your browser in. It uses the same code as the command-line tools below, so you can mix the two.
 
@@ -86,6 +87,33 @@ This goes through Claude Code's own `claude mcp add` and `claude mcp remove` ins
 
 Project scope writes this machine's absolute paths into a file meant to be committed, so teammates would need the same paths. Prefer `user` or `local`. Start a new Claude Code session and run `/mcp` to check the server.
 
+## Remote server (claude.ai, mobile, connectors)
+
+claude.ai and the Claude mobile apps connect to MCP servers from Anthropic's cloud, so the server has to run somewhere public over HTTPS. The same `runtime.py` serves Streamable HTTP at `/mcp`, stateless, so any number of copies can run behind a load balancer.
+
+```powershell
+uv run remote.py token --project project.json          # create the bearer token (kept in the OS keychain)
+uv run remote.py env --project project.json            # the environment variables a host needs
+uv run remote.py serve --project project.json          # run it on 127.0.0.1:8000 with your token
+uv run remote.py test --project project.json --url https://your-host/mcp --tool get_current_weather --args '{"q": "Boise,US"}'
+```
+
+**Try it from your PC first** with a free Cloudflare quick tunnel (install `cloudflared`, no account needed): run `remote.py serve` in one terminal and `cloudflared tunnel --url http://127.0.0.1:8000` in another. The tunnel prints a temporary `https://...trycloudflare.com` URL; add `/mcp` to it.
+
+**Deploy** to any host that runs containers (Render, Railway, Fly.io, a VPS) with the included `Dockerfile`:
+
+```powershell
+docker build --build-arg PROJECT=project.json -t mcp-weather .
+docker run --rm -p 8000:8000 -e MCP_BEARER_TOKEN -e MCP_SECRET_WEATHER_OPENWEATHER_APIKEY mcp-weather
+```
+
+No secret is baked into the image. On a host there's no OS keychain, so the runtime reads each `secret://<account>` from an environment variable named `MCP_SECRET_<ACCOUNT>` (`remote.py env` lists them; `--values` prints the values for pasting into the host's secret settings).
+
+**Connect Claude:**
+
+- **claude.ai, mobile and Claude Desktop:** in claude.ai, Settings → Connectors → Add custom connector. Enter the URL and choose **No sign-in** under Authentication (claude.ai otherwise detects the 401 and tries OAuth). Under Request headers add `x-api-key` with the token as the value; `Authorization: Bearer <token>` also works where that name is selectable. Request headers are a beta that may not show in every account yet; OAuth (milestone 6) is the alternative.
+- **Claude Code:** `uv run install.py add --project project.json --client claude-code --url https://your-host/mcp` registers `<name>-remote` with the token as a header.
+
 ## Import any API from its OpenAPI spec
 
 ```powershell
@@ -115,6 +143,8 @@ After importing, read the tool descriptions in the project file. The importer li
 | `uv run install.py add --project project.json` | Verify and register the project with Claude Desktop |
 | `uv run install.py remove --project project.json` | Remove the entry this installer added |
 | `uv run install.py add --project project.json --client claude-code` | Register with Claude Code (see above) |
+| `uv run install.py add --project project.json --client claude-code --url URL` | Register a remote server with Claude Code |
+| `uv run remote.py token / env / serve / test` | Remote server helpers (see above) |
 | `uv run install.py list` | Show every MCP server in each Claude Desktop config found |
 | `uv run gui.py` | Open the browser UI (`--no-browser` to just print the link) |
 | `uv run import_openapi.py SPEC --out project.json` | Turn an OpenAPI spec into tools (see above) |
@@ -184,6 +214,7 @@ Adding a tool is a JSON edit and a Claude Desktop restart. No code changes.
 - **Config writes are checked and reversible.** The installer refuses to touch a config it can't parse, shows a diff, backs up to `~/.mcpgui/backups`, writes to a temp file and swaps it in, re-reads the result, and restores the backup if it doesn't match.
 - **Nothing is installed blind.** Before writing, the installer starts the runtime exactly as Claude Desktop will and lists the tools Claude is about to get.
 - **The UI only answers to you.** It binds to `127.0.0.1`, signs in with a random one-time token, rejects requests with an unexpected `Host` header (DNS rebinding) or a foreign `Origin` (cross-site form posts), and sends a Content-Security-Policy that allows no scripts. A config change previewed in the UI is refused if the file changed before you confirm.
+- **Remote servers always require a bearer token**, even on 127.0.0.1, because a tunnel or proxy can make localhost public. The token is accepted as `Authorization: Bearer <token>` or `X-API-Key: <token>`. Tokens are 256-bit random values, compared in constant time, and refused if shorter than 32 characters. URLs must be `https://` (plain `http` only for 127.0.0.1). The GUI and CLI never print a token in a command preview, and GUI pages are sent with `Cache-Control: no-store`.
 - **Merges, never overwrites.** Other servers and the app's own settings are left untouched. Replacing an entry the installer didn't create needs explicit confirmation.
 
 ## Troubleshooting
@@ -193,6 +224,10 @@ Adding a tool is a JSON edit and a Claude Desktop restart. No code changes.
 **The server shows as failed.** Read its log. The runtime writes errors to stderr, which Claude Desktop records per server (`mcp-server-<name>.log`).
 
 **The UI says Claude Code isn't available.** The `claude` command has to be on PATH for the terminal that runs `gui.py`. Open a new terminal after installing Claude Code.
+
+**A remote test says 401.** The host's `MCP_BEARER_TOKEN` doesn't match the token in your keychain. Run `remote.py token` to see yours, or `--new` to replace it (then update the host and every client).
+
+**claude.ai can't connect but Claude Code can.** claude.ai connects from Anthropic's servers, so a `127.0.0.1` URL only works on your PC. Use the tunnel URL or your host's URL.
 
 **Changes don't show up.** Claude Desktop only reads the config at startup, and closing the window leaves it running in the tray. Quit it fully.
 
@@ -206,7 +241,7 @@ Python 3.13, [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk
 2. ~~OpenAPI import: generate `project.json` from a spec, pick operations, edit descriptions~~
 3. ~~Built-in tester: call each tool from the UI and see the raw result~~
 4. ~~Claude Code adapter~~
-5. Remote deployment: Streamable HTTP, Docker, static bearer auth
+5. ~~Remote deployment: Streamable HTTP, Docker, static bearer auth~~
 6. OAuth upstream and inbound
 7. MCP Registry servers, more clients, MCPB export
 
