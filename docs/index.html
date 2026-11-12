@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP Setup: give Claude any API, without hand-editing config files</title>
+<meta name="description" content="Turn an HTTP API into MCP tools and install them in Claude Desktop, Claude Code or claude.ai. Import OpenAPI specs, test tools, keep keys in the OS keychain.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600;750&family=Public+Sans:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #f3f5f7;
+  --ink: #18202b;
+  --quiet: #566275;
+  --rule: #cbd3dc;
+  --add-bg: #ddf1e4;
+  --add-ink: #17663f;
+  --del-bg: #f8e1de;
+  --del-ink: #a1281c;
+  --mono: "Martian Mono", ui-monospace, Consolas, monospace;
+  --sans: "Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+html { background: var(--paper); color: var(--ink); }
+body { margin: 0; font: 17px/1.6 var(--sans); }
+main { max-width: 46rem; margin: 0 auto; padding: 4.5rem 1.5rem 5rem; }
+a { color: var(--ink); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:hover { text-decoration-thickness: 2px; }
+a:focus-visible, summary:focus-visible { outline: 3px solid var(--add-ink); outline-offset: 3px; border-radius: 2px; }
+
+/* The headline is a diff: the old way removed, the new way added */
+.diff { margin: 0 0 2rem; font-family: var(--mono); font-weight: 750; letter-spacing: -0.02em;
+        font-size: clamp(1.15rem, 4.2vw, 2.35rem); line-height: 1.25; }
+.diff span { display: block; padding: 0.35em 0.6em 0.35em 1.7em; position: relative; overflow-wrap: anywhere; }
+.diff span::before { position: absolute; left: 0.55em; font-weight: 400; }
+.diff .del { background: var(--del-bg); color: var(--del-ink); text-decoration: line-through;
+             text-decoration-thickness: 0.07em; }
+.diff .del::before { content: "-"; }
+.diff .add { background: var(--add-bg); color: var(--add-ink); }
+.diff .add::before { content: "+"; }
+@media (prefers-reduced-motion: no-preference) {
+  .diff .add { animation: land 700ms 350ms both cubic-bezier(.2,.7,.2,1); }
+  @keyframes land { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+}
+
+.lede { font-size: 1.2rem; max-width: 36rem; margin: 0 0 1.75rem; }
+.links { display: flex; flex-wrap: wrap; gap: 0.75rem 1.5rem; margin: 0 0 3.5rem; font-weight: 600; }
+.links .primary { background: var(--ink); color: var(--paper); text-decoration: none; padding: 0.6rem 1.1rem; border-radius: 4px; }
+.links .primary:hover { background: var(--add-ink); }
+.links .primary:focus-visible { outline-color: var(--add-ink); }
+.links a:not(.primary) { padding: 0.6rem 0; }
+
+figure { margin: 0 0 4rem; }
+figure img { display: block; width: 100%; height: auto; border: 1px solid var(--rule); border-radius: 6px; background: #fff; }
+figcaption { color: var(--quiet); font-size: 0.9rem; margin-top: 0.6rem; }
+
+h2 { font-family: var(--mono); font-weight: 600; font-size: 1.15rem; letter-spacing: -0.01em;
+     margin: 3.5rem 0 1.1rem; padding-top: 1.25rem; border-top: 1px solid var(--rule); }
+p { margin: 0 0 1rem; }
+
+dl.features { margin: 0; }
+.features div { padding: 0.9rem 0; border-bottom: 1px solid var(--rule); }
+.features div:last-child { border-bottom: 0; }
+.features dt { font-weight: 600; }
+.features dd { margin: 0.15rem 0 0; color: var(--quiet); }
+
+ol.flow { list-style: none; padding: 0; margin: 0 0 1rem; counter-reset: step; }
+ol.flow li { counter-increment: step; display: grid; grid-template-columns: 2.4rem 1fr; padding: 0.55rem 0; }
+ol.flow li::before { content: counter(step); font-family: var(--mono); font-weight: 600; color: var(--add-ink); }
+code, pre { font-family: var(--mono); font-size: 0.82em; }
+:not(pre) > code { background: #e4e8ed; padding: 0.1em 0.35em; border-radius: 3px; }
+pre { background: var(--ink); color: #e9edf2; padding: 1.1rem 1.25rem; border-radius: 6px; overflow-x: auto;
+      line-height: 1.7; margin: 0 0 1rem; }
+pre .c { color: #8fa0b5; }
+
+ul.plain { padding-left: 1.2rem; margin: 0; }
+ul.plain li { margin: 0 0 0.6rem; }
+
+footer { margin-top: 4.5rem; padding-top: 1.25rem; border-top: 1px solid var(--rule); color: var(--quiet); font-size: 0.92rem; }
+
+@media (max-width: 34rem) {
+  main { padding-top: 2.5rem; }
+  body { font-size: 16px; }
+  .diff span { padding-left: 1.4em; }
+}
+</style>
+</head>
+<body>
+<main>
+
+<h1 class="diff" aria-label="MCP Setup: pick an API, click Install, instead of hand-editing claude_desktop_config.json">
+  <span class="del" aria-hidden="true">hand-edit claude_desktop_config.json</span>
+  <span class="add" aria-hidden="true">pick an API, click Install</span>
+</h1>
+
+<p class="lede">MCP Setup turns any HTTP API into tools Claude can use, and installs them in Claude Desktop, Claude Code or claude.ai. Your API keys stay in your operating system's keychain.</p>
+
+<div class="links">
+  <a class="primary" href="https://github.com/ksapp17/mcp-setup-gui">View the code on GitHub</a>
+  <a href="#start">Run it in five minutes</a>
+</div>
+
+<figure>
+  <img src="demo.gif" alt="Importing an OpenAPI spec in MCP Setup, installing it in Claude Desktop, then asking Claude a question it answers with the new tool" width="1280" height="800">
+  <figcaption>Import a spec, test a tool, install it, and Claude uses it in the next chat.</figcaption>
+</figure>
+
+<h2>What it does</h2>
+<dl class="features">
+  <div><dt>Import an API from its OpenAPI spec</dt>
+       <dd>Paste a spec URL and pick the operations you want. Read-only ones are preselected; deletes are marked so Claude asks first.</dd></div>
+  <div><dt>Install without touching JSON</dt>
+       <dd>Shows the exact change to Claude's config file, backs it up, writes it safely, and checks the result. Works with Claude Desktop and Claude Code.</dd></div>
+  <div><dt>Test every tool before Claude sees it</dt>
+       <dd>Call a tool from the browser and see the raw response, its size in tokens, and which fields to keep so big responses don't flood Claude's context.</dd></div>
+  <div><dt>Run it remotely for claude.ai and your phone</dt>
+       <dd>One command serves the tools over HTTPS, with a built-in OAuth sign-in so claude.ai's "Add custom connector" just works. A Dockerfile is included for hosting.</dd></div>
+  <div><dt>Use APIs that need you to sign in</dt>
+       <dd>OAuth with PKCE for GitHub, Google, Spotify and others. Tokens refresh on their own, even when two Claude apps share one sign-in.</dd></div>
+  <div><dt>Install ready-made servers from the MCP Registry</dt>
+       <dd>Search the official registry and install npm, PyPI or Docker servers, with their keys kept out of config files too.</dd></div>
+</dl>
+
+<h2>How it works</h2>
+<ol class="flow">
+  <li><span>You describe an API in <code>project.json</code>: its base URL, how it authenticates, and the tools it offers. The importer can write this for you.</span></li>
+  <li><span>A small generic server, <code>runtime.py</code>, reads that file and turns each tool into an HTTP call, adding the key from the keychain at the last moment.</span></li>
+  <li><span>The installer registers that server with Claude. Adding a tool later is a JSON edit and a restart, never new code.</span></li>
+</ol>
+
+<h2>Where your keys go</h2>
+<ul class="plain">
+  <li>Into the OS keychain only. Config files, the repo and logs hold a <code>secret://</code> reference, never the key.</li>
+  <li>Errors report the type of failure, never the request URL, since that can contain a key.</li>
+  <li>A tool argument can't send a request to another host or replace the auth header.</li>
+  <li>The browser UI answers only on 127.0.0.1, only to the person holding its one-time link, and allows no scripts.</li>
+  <li>Remote servers always require a token, and their sign-in tokens are signed, bound to the server, and revoked all at once by rotating the token.</li>
+</ul>
+
+<h2 id="start">Run it</h2>
+<p>You need Python 3.13 and <a href="https://docs.astral.sh/uv/">uv</a>. Windows, macOS and Linux all work.</p>
+<pre><code>git clone https://github.com/ksapp17/mcp-setup-gui
+cd mcp-setup-gui
+uv sync
+uv run gui.py        <span class="c"># opens the browser UI</span></code></pre>
+<p>Then import a spec (try Open-Meteo's weather API, which needs no key), test a tool, and click Install. The <a href="https://github.com/ksapp17/mcp-setup-gui#readme">README</a> covers the command-line versions, remote hosting, OAuth and the full <code>project.json</code> format.</p>
+
+<footer>
+  Built by Kaden (<a href="https://github.com/ksapp17">ksapp17</a>) in Python with the MCP Python SDK. 63 automated tests run on Windows and Linux for every push.
+  <a href="https://github.com/ksapp17/mcp-setup-gui">Source on GitHub</a>.
+</footer>
+
+</main>
+</body>
+</html>

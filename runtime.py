@@ -68,6 +68,12 @@ def load_project(path_str):
                 # Stops a pasted literal key from ever living in project.json
                 raise SystemExit(f"{api['id']}: secretRef must start with secret://")
         for tool in api["tools"]:
+            fields = tool.get("responseFields")
+            if fields is not None and not (isinstance(fields, list) and all(isinstance(f, str) and f for f in fields)):
+                raise SystemExit(f"{tool['name']}: responseFields must be a list of field paths like \"stats.base_stat\"")
+            cap = tool.get("responseMaxItems")
+            if cap is not None and not (isinstance(cap, int) and cap > 0):
+                raise SystemExit(f"{tool['name']}: responseMaxItems must be a whole number above 0")
             if tool["name"] in seen:
                 raise SystemExit(f"Duplicate tool name: {tool['name']}")
             seen.add(tool["name"])
@@ -265,7 +271,54 @@ async def call_upstream(api, tool, arguments, key, byte_cap):
 
     if response.status_code >= 400:
         raise ValueError(f"Upstream returned {response.status_code}: {truncate(response.text, 2_000)}")
-    return truncate(response.text, byte_cap)
+    return truncate(shape_response(response.text, tool), byte_cap)
+
+
+def keep_fields(value, paths):
+    """Keep only the given paths. Lists are walked through, so "stats.base_stat" keeps
+    base_stat in every item of the stats list. Paths are lists of keys."""
+    if isinstance(value, list):
+        return [keep_fields(v, paths) for v in value]
+    if not isinstance(value, dict):
+        return value
+    wanted = {}
+    for path in paths:
+        wanted.setdefault(path[0], []).append(path[1:])
+    out = {}
+    for key, rests in wanted.items():
+        if key not in value:
+            continue
+        out[key] = value[key] if any(not r for r in rests) else keep_fields(value[key], rests)
+    return out
+
+
+def cap_lists(value, limit):
+    """Shorten every list to limit items, saying how many were left out."""
+    if isinstance(value, list):
+        kept = [cap_lists(v, limit) for v in value[:limit]]
+        if len(value) > limit:
+            kept.append(f"... {len(value) - limit} more")
+        return kept
+    if isinstance(value, dict):
+        return {k: cap_lists(v, limit) for k, v in value.items()}
+    return value
+
+
+def shape_response(text, tool):
+    """Apply a tool's responseFields and responseMaxItems to a JSON response.
+    Anything that isn't JSON, or a tool without either setting, passes through unchanged."""
+    fields, limit = tool.get("responseFields"), tool.get("responseMaxItems")
+    if not fields and not limit:
+        return text
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return text
+    if fields:
+        value = keep_fields(value, [f.split(".") for f in fields])
+    if limit:
+        value = cap_lists(value, limit)
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def truncate(text, cap):
@@ -286,6 +339,8 @@ def tool_error(message):
 def build_server(project, keys):
     tools = enabled_tools(project)
     byte_cap = project.get("responseByteCap", 50_000)
+    if os.environ.get("MCP_TESTER_FULL_RESPONSE") == "1":
+        byte_cap = 20_000_000  # the GUI's tester wants the whole response, to show what the cap cuts off
 
     async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
         listed = []

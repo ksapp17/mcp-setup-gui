@@ -12,6 +12,7 @@ Pages are plain HTML forms handled in Python. There is no JavaScript.
 import argparse
 import copy
 import os
+import re
 import hashlib
 import html
 import json
@@ -42,6 +43,7 @@ import claude_code
 import import_openapi as importer
 import install as installer
 import remote
+from runtime import truncate
 import registry
 import upstream_oauth as upstream
 
@@ -450,7 +452,11 @@ async def show_project(request):
   <td><input type="checkbox" name="en_{a_i}_{t_i}" value="1" {on}></td>
   <td><b>{e(tool["name"])}</b><br><span class="muted">{e(tool["method"])} {e(tool["path"])}</span>
       <div class="muted">Args: {e(args_summary(tool))}</div></td>
-  <td><textarea name="desc_{a_i}_{t_i}">{e(tool.get("description", ""))}</textarea></td></tr>"""
+  <td><textarea name="desc_{a_i}_{t_i}">{e(tool.get("description", ""))}</textarea>
+      <div class="row"><div><label>Keep only these response fields <span class="muted">(optional, comma-separated, e.g. name, types.type.name)</span></label>
+      <input type="text" name="fields_{a_i}_{t_i}" value="{e(", ".join(tool.get("responseFields") or []))}"></div>
+      <div><label>Max items per list <span class="muted">(optional)</span></label>
+      <input type="text" name="max_{a_i}_{t_i}" value="{e(str(tool.get("responseMaxItems") or ""))}" inputmode="numeric"></div></div></td></tr>"""
         apis_html += f"""
 <div class="card"><b>{e(api["id"])}</b> <span class="muted"><code>{e(api["baseUrl"])}</code></span>
 <div>{auth_line}</div>{secret_form}</div>"""
@@ -651,6 +657,21 @@ async def save_project(request):
             desc = " ".join(form.get(f"desc_{a_i}_{t_i}", "").split())
             if desc:
                 tool["description"] = desc
+            fields = [f.strip() for f in form.get(f"fields_{a_i}_{t_i}", "").replace("\n", ",").split(",") if f.strip()]
+            if fields:
+                bad = [f for f in fields if not re.fullmatch(r"[^.\s]+(\.[^.\s]+)*", f)]
+                if bad:
+                    raise UserError(f"{tool['name']}: {bad[0]!r} isn't a field path. Use names joined by dots, like stats.base_stat.")
+                tool["responseFields"] = fields
+            else:
+                tool.pop("responseFields", None)
+            cap = form.get(f"max_{a_i}_{t_i}", "").strip()
+            if cap:
+                if not cap.isdigit() or int(cap) < 1:
+                    raise UserError(f"{tool['name']}: max items must be a whole number above 0.")
+                tool["responseMaxItems"] = int(cap)
+            else:
+                tool.pop("responseMaxItems", None)
     installer.atomic_write(path, installer.to_text(data))
     return go("/project", file=rel, msg="Saved. Restart Claude Desktop if this project is installed.")
 
@@ -1012,7 +1033,7 @@ def run_tool(project_path, tool_name, arguments):
             params = StdioServerParameters(
                 command=sys.executable,
                 args=[str(installer.RUNTIME), "--project", str(project_path)],
-                env=dict(os.environ))
+                env={**os.environ, "MCP_TESTER_FULL_RESPONSE": "1"})
             with anyio.fail_after(60):
                 async with stdio_client(params, errlog=errlog) as (read, write):
                     async with ClientSession(read, write) as session:
@@ -1051,6 +1072,21 @@ def parse_arguments(form):
     return arguments
 
 
+def field_paths(value, prefix="", depth=0, found=None):
+    """Every dot path in a JSON value, walking through lists, up to 4 levels deep."""
+    found = [] if found is None else found
+    if isinstance(value, list):
+        for item in value[:20]:
+            field_paths(item, prefix, depth, found)
+    elif isinstance(value, dict) and depth < 4:
+        for key, child in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if path not in found:
+                found.append(path)
+            field_paths(child, path, depth + 1, found)
+    return found
+
+
 def result_page(request, rel, data, tool, arguments, result, error, stderr, where="local runtime"):
     if result is None:
         status = '<span class="tag bad">runtime failed</span>'
@@ -1058,17 +1094,31 @@ def result_page(request, rel, data, tool, arguments, result, error, stderr, wher
         raw = ""
     else:
         status = '<span class="tag bad">tool error</span>' if result.is_error else '<span class="tag ok">ok</span>'
-        text = "\n".join(getattr(c, "text", "") for c in result.content)
+        full = "\n".join(getattr(c, "text", "") for c in result.content)
+        cap = data.get("responseByteCap", 50_000)
+        text = truncate(full, cap)  # what Claude actually gets
+        size = f"Claude gets {len(text.encode('utf-8')):,} bytes (about {len(text) // 4:,} tokens)."
+        if len(full.encode("utf-8")) > cap:
+            size += (f'<div class="msg error">The full response is {len(full.encode("utf-8")):,} bytes, so it gets cut off '
+                     f'at {cap:,}. Pick the fields you need on the project page so the useful part isn\'t lost.</div>')
         try:
             output = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
         except (json.JSONDecodeError, TypeError):
             output = text
+        try:
+            paths = field_paths(json.loads(full))
+        except (json.JSONDecodeError, TypeError):
+            paths = []
+        if paths:
+            size += ("<div class=\"muted\">Fields in this response, for <i>Keep only these response fields</i>: "
+                     + ", ".join(f"<code>{e(p)}</code>" for p in paths[:80])
+                     + (f" and {len(paths) - 80} more" if len(paths) > 80 else "") + "</div>")
         raw = json.dumps(result.model_dump(by_alias=True, exclude_none=True), indent=2, ensure_ascii=False)
 
     body = f"""
 <h1>{e(tool)}</h1><p class="sub">{e(data["name"])} · {e(where)} · {status} · <a href="/project?{urlencode({"file": rel})}">Back to project</a></p>
 <h2>Arguments</h2><pre>{e(json.dumps(arguments, indent=2, ensure_ascii=False))}</pre>
-<h2>Response</h2><pre>{e(output)}</pre>
+<h2>Response</h2>{f'<div class="muted" style="margin-bottom:10px">{size}</div>' if result is not None else ''}<pre>{e(output)}</pre>
 {f'<h2>Raw MCP result</h2><pre>{e(raw)}</pre>' if raw else ''}
 {f'<h2>Runtime log (stderr)</h2><pre>{e(stderr)}</pre>' if stderr.strip() else ''}"""
     return page(f"Test {tool}", body, request)

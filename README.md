@@ -1,5 +1,7 @@
 # mcp-setup-gui
 
+[Project page](https://ksapp17.github.io/mcp-setup-gui/) · ![tests](https://github.com/ksapp17/mcp-setup-gui/actions/workflows/tests.yml/badge.svg)
+
 Turn an HTTP API into tools Claude can use, without writing server code or hand-editing config files.
 
 You describe an API in `project.json`. A generic MCP runtime serves every endpoint you list as a tool, and an installer registers it with Claude Desktop safely: it verifies the server first, shows a diff, backs up the config, and can undo the change.
@@ -266,9 +268,13 @@ One project becomes one MCP server. Each API has a base URL, how to authenticate
 | `description` | What Claude reads to decide when to call the tool. The main quality lever. |
 | `annotations` | MCP tool hints, e.g. `readOnlyHint` |
 | `enabled` | Optional, defaults to `true` |
+| `responseFields` | Optional. Keep only these parts of a JSON response, as dot paths: `["name", "types.type.name", "stats.base_stat"]`. Lists are walked through, so `stats.base_stat` keeps `base_stat` in every item of `stats`. The tester lists every path in a response to pick from. |
+| `responseMaxItems` | Optional. Shorten every list in the response to this many items, noting how many were left out. |
 | `responseByteCap` | Responses longer than this are truncated (default 50,000 bytes) |
 
 Adding a tool is a JSON edit and a Claude Desktop restart. No code changes.
+
+**Keep responses small.** Everything a tool returns goes into Claude's context. Some APIs send a lot: one PokéAPI Pokémon is over 300 KB, mostly move lists, and the useful fields come after them, so the cap cuts them off. Run the tool in the tester: it shows how many bytes Claude would get, warns when the cap cuts the response off, and lists the response's fields. Put the ones you need in **Keep only these response fields** for that tool.
 
 ## Security design
 
@@ -306,6 +312,15 @@ Adding a tool is a JSON edit and a Claude Desktop restart. No code changes.
 **claude.ai can't connect but Claude Code can.** claude.ai connects from Anthropic's servers, so a `127.0.0.1` URL only works on your PC. Use the tunnel URL or your host's URL.
 
 **Changes don't show up.** Claude Desktop only reads the config at startup, and closing the window leaves it running in the tray. Quit it fully.
+
+## Tests
+
+```powershell
+uv add --dev pytest     # once
+uv run pytest -q
+```
+
+The suite (`tests/`) runs offline in about a second. It covers how requests are built and where auth goes, the SSRF and secret-leak guards, response trimming, the built-in OAuth server (tampered, reused and cross-server tokens), upstream OAuth refresh and rotation (including two Claude clients sharing one sign-in), the OpenAPI importer, registry install plans, config writes and backups, and the UI's Host, token and cross-site checks. APIs are mocked and the keychain is in memory, so nothing touches your real config or secrets. GitHub Actions runs it on Windows and Linux for every push.
 
 ## Built with
 

@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run pytest -q
+
+  docker:
+    # Builds the image and calls the server inside it, the way a host would run it
+    runs-on: ubuntu-latest
+    env:
+      MCP_BEARER_TOKEN: ci-only-token-not-a-secret-0123456789abcdef
+      MCP_SECRET_WEATHER_OPENWEATHER_APIKEY: dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: docker build --build-arg PROJECT=project.json -t mcp-ci .
+      - run: docker run -d --name mcp -p 8000:8000 -e MCP_BEARER_TOKEN -e MCP_SECRET_WEATHER_OPENWEATHER_APIKEY mcp-ci
+      - name: Wait for /health
+        run: for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/health && exit 0; sleep 1; done; exit 1
+      - name: List tools over MCP with the token
+        run: uv sync && uv run remote.py test --project project.json --url http://127.0.0.1:8000/mcp --token "$MCP_BEARER_TOKEN"
+      - name: Without the token it's refused
+        run: test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp)" = "401"
+      - if: failure()
+        run: docker logs mcp
