@@ -1,7 +1,7 @@
 [project]
 name = "pythonmcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "Turn HTTP APIs into MCP tools and install them in Claude"
 readme = "README.md"
 authors = [
     { name = "Kaden", email = "kadenmsapp@gmail.com" }
@@ -14,9 +14,11 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
-[project.scripts]
-pythonmcp = "pythonmcp:main"
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
 
-[build-system]
-requires = ["uv_build>=0.13.7,<0.14.0"]
-build-backend = "uv_build"
+[tool.uv]
+# Plain scripts, not an installable package: uv sync installs the dependencies only
+package = false
